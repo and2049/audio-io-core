@@ -581,7 +581,6 @@ ae_result ae_stream_start(ae_stream *stream, ae_process_fn process, void *user) 
       return result;
     }
     if (result != AE_OK) {
-      stream->run_generation.fetch_sub(1, std::memory_order_relaxed);
       stream->process = nullptr;
       stream->user = nullptr;
       stream->failure_latched.store(false, std::memory_order_relaxed);

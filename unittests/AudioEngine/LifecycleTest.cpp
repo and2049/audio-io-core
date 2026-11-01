@@ -331,12 +331,13 @@ void testFailedStartKeepsReady(TestBackend::Failure failure) {
   ae_stream_status status = emptyStatus();
   AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
   AE_CHECK(status.state == AE_STREAM_STATE_READY);
-  AE_CHECK(status.run_generation == 0);
+  AE_CHECK(status.run_generation == 1);
   AE_CHECK(status.last_result == expected);
   AE_CHECK(status.delivered_frames == 0);
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   AE_CHECK(recorder.calls.load(std::memory_order_acquire) == 0);
 
+  configureRecorder(recorder, format, 2);
   AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_OK);
   waitForCalls(recorder, 2);
   AE_CHECK(ae_stream_stop(stream) == AE_OK);

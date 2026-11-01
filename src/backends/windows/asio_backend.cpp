@@ -401,15 +401,13 @@ public:
     switch (selector) {
     case kAsioSelectorSupported:
       return value == kAsioResetRequest || value == kAsioResyncRequest ||
-             value == kAsioBufferSizeChange || value == kAsioLatenciesChanged ||
-             value == kAsioEngineVersion || value == kAsioSupportsTimeInfo ||
-             value == kAsioOverload;
+             value == kAsioLatenciesChanged || value == kAsioEngineVersion ||
+             value == kAsioSupportsTimeInfo || value == kAsioOverload;
     case kAsioEngineVersion:
       return 2;
     case kAsioSupportsTimeInfo:
       return 0;
     case kAsioResetRequest:
-    case kAsioBufferSizeChange:
       faults_.fetch_or(AE_FAULT_RESET);
       return 1;
     case kAsioResyncRequest:

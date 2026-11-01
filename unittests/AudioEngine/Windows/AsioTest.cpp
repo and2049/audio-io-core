@@ -396,7 +396,7 @@ void failures() {
   ae_stream_status rollback{};
   rollback.struct_size = sizeof(rollback);
   AE_CHECK(ae_stream_get_status(stream, &rollback) == AE_OK);
-  AE_CHECK(rollback.state == AE_STREAM_STATE_READY && rollback.run_generation == 0);
+  AE_CHECK(rollback.state == AE_STREAM_STATE_READY && rollback.run_generation == 1);
   state.fail_stop = true;
   AE_CHECK(ae_stream_start(stream, process, &processor) == AE_ERROR_QUIESCENCE_FAILURE);
   AE_CHECK(ae_stream_close(stream) == AE_ERROR_QUIESCENCE_FAILURE);
@@ -653,6 +653,82 @@ void channel_routing() {
 }
 }
 
+namespace {
+struct RunHistory {
+  uint32_t generation = 0;
+  uint32_t resets = 0;
+  uint32_t calls = 0;
+  uint64_t frames = 0;
+};
+
+ae_process_result track_run(void *user, const ae_audio_block *block) {
+  auto &history = *static_cast<RunHistory *>(user);
+  if (history.generation != block->run_generation) {
+    history.generation = block->run_generation;
+    history.frames = 0;
+    ++history.resets;
+  }
+  AE_CHECK(block->frame_position == history.frames);
+  history.frames += block->frames;
+  ++history.calls;
+  return AE_PROCESS_SILENCE;
+}
+
+void start_attempt_identity() {
+  state.owner = 0;
+  state.threaded = false;
+  state.early_stop = false;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  RunHistory history;
+  state.fail_start = true;
+  AE_CHECK(ae_stream_start(stream, track_run, &history) == AE_ERROR_DRIVER_FAILURE);
+  AE_CHECK(history.calls == 1 && history.resets == 1 && history.generation == 1);
+  state.fail_start = false;
+  AE_CHECK(ae_stream_start(stream, track_run, &history) == AE_OK);
+  AE_CHECK(history.calls == 2 && history.resets == 2 && history.generation == 2);
+  AE_CHECK(history.frames == format.frames_per_block);
+  AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  AE_CHECK(ae_stream_start(stream, track_run, &history) == AE_OK);
+  AE_CHECK(history.calls == 3 && history.resets == 3 && history.generation == 3);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
+
+void unsupported_buffer_resize() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  Processor processor;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  AE_CHECK(state.callbacks.asioMessage(kAsioSelectorSupported, kAsioBufferSizeChange, nullptr,
+                                       nullptr) == 0);
+  AE_CHECK(state.callbacks.asioMessage(kAsioBufferSizeChange, 64, nullptr, nullptr) == 0);
+  ae_stream_status status{};
+  status.struct_size = sizeof(status);
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
+  AE_CHECK(status.state == AE_STREAM_STATE_RUNNING && status.fault_flags == 0);
+  AE_CHECK(ae_stream_get_format(stream, &format) == AE_OK && format.frames_per_block == 128);
+  state.callbacks.bufferSwitch(1, ASIOTrue);
+  AE_CHECK(processor.calls == 2);
+  AE_CHECK(state.callbacks.asioMessage(kAsioSelectorSupported, kAsioResetRequest, nullptr,
+                                       nullptr) == 1);
+  AE_CHECK(state.callbacks.asioMessage(kAsioResetRequest, 0, nullptr, nullptr) == 1);
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK && status.fault_flags == AE_FAULT_RESET);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
+
+}
+
 int main() {
   static_assert(sizeof(long) == 4 && sizeof(ASIOSamples) == 8 && sizeof(ASIOBufferInfo) == 24);
   lifecycle();
@@ -662,4 +738,6 @@ int main() {
   allocation_cleanup();
   channel_routing();
   in_flight_stop();
+  start_attempt_identity();
+  unsupported_buffer_resize();
 }
