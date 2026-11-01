@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 namespace ae {
 namespace {
@@ -37,8 +38,14 @@ void decode_samples(SampleFormat format, const void *source, float *destination,
     const uint64_t raw = read_sample(bytes + static_cast<size_t>(i) * format.bytes, format);
     float value;
     if (format.floating) {
-      value = format.bytes == 4 ? std::bit_cast<float>(static_cast<uint32_t>(raw))
-                                : static_cast<float>(std::bit_cast<double>(raw));
+      if (format.bytes == 4) {
+        value = std::bit_cast<float>(static_cast<uint32_t>(raw));
+      } else {
+        const double sample = std::bit_cast<double>(raw);
+        value = std::isfinite(sample) && std::abs(sample) <= std::numeric_limits<float>::max()
+                    ? static_cast<float>(sample)
+                    : 0.0f;
+      }
     } else {
       const uint64_t sign = uint64_t{1} << (format.bytes * 8 - 1);
       const int64_t signed_value = (raw & sign) != 0

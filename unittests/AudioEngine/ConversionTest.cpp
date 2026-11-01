@@ -1,11 +1,59 @@
 #include <array>
+#include <bit>
 #include <cmath>
 #include <limits>
 
 #include "Check.h"
 #include "sample_conversion.h"
 
+namespace {
+void float64_boundaries() {
+  const double maximum = std::numeric_limits<float>::max();
+  const double infinity = std::numeric_limits<double>::infinity();
+  const double values[] = {0.0,
+                           -0.0,
+                           0.25,
+                           -0.25,
+                           2.0,
+                           -2.0,
+                           maximum,
+                           -maximum,
+                           std::nextafter(maximum, 0.0),
+                           std::nextafter(-maximum, 0.0),
+                           std::nextafter(maximum, infinity),
+                           std::nextafter(-maximum, -infinity),
+                           1.0e40,
+                           -1.0e40,
+                           std::numeric_limits<double>::max(),
+                           -std::numeric_limits<double>::max(),
+                           infinity,
+                           -infinity,
+                           std::numeric_limits<double>::quiet_NaN()};
+  for (bool big : {false, true}) {
+    for (double value : values) {
+      const uint64_t raw = std::bit_cast<uint64_t>(value);
+      std::array<uint8_t, 10> bytes;
+      bytes.fill(0xcd);
+      for (uint32_t byte = 0; byte < 8; ++byte) {
+        bytes[1 + (big ? 7 - byte : byte)] = static_cast<uint8_t>(raw >> (8 * byte));
+      }
+      std::array<float, 3> decoded{42.0f, 42.0f, 42.0f};
+      ae::decode_samples({8, true, big}, bytes.data() + 1, decoded.data() + 1, 1);
+      AE_CHECK(decoded.front() == 42.0f && decoded.back() == 42.0f);
+      AE_CHECK(bytes.front() == 0xcd && bytes.back() == 0xcd);
+      if (!std::isfinite(value) || std::abs(value) > maximum) {
+        AE_CHECK(decoded[1] == 0.0f);
+      } else {
+        AE_CHECK(decoded[1] == static_cast<float>(value));
+        AE_CHECK(std::signbit(decoded[1]) == std::signbit(value));
+      }
+    }
+  }
+}
+}
+
 int main() {
+  float64_boundaries();
   AE_CHECK(!ae::valid_format({1, false, false}));
   AE_CHECK(!ae::valid_format({3, true, false}));
   const float input[] = {-2.0f,
