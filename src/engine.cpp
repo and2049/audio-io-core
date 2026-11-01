@@ -17,6 +17,11 @@ struct ae_device_snapshot {
   std::vector<ae_device_info> infos;
 };
 
+struct ae_capability_snapshot {
+  ae_context *context = nullptr;
+  ae::Capabilities capabilities;
+};
+
 struct ae_stream {
   ae_context *context = nullptr;
   ae::Backend *backend = nullptr;
@@ -28,6 +33,8 @@ struct ae_stream {
   std::atomic<bool> failure_latched{false};
   ae_process_fn process = nullptr;
   void *user = nullptr;
+  std::vector<uint32_t> inputs;
+  std::vector<uint32_t> outputs;
 };
 
 struct ae_context {
@@ -123,7 +130,7 @@ public:
   }
   ae_result start(ae::BackendProcessFn, void *) override { return AE_ERROR_INVALID_STATE; }
   ae_result stop() override { return AE_OK; }
-  void close() noexcept override {}
+  ae_result close() override { return AE_OK; }
 
 private:
   std::vector<ae::Device> devices_;
@@ -139,7 +146,7 @@ ae_process_result dispatch(void *state, const float *const *inputs, uint32_t inp
     }
   };
   silence();
-  if (stream->failure_latched.load(std::memory_order_acquire)) {
+  if (stream->failure_latched.load(std::memory_order_acquire) || stream->backend->faults() != 0) {
     return AE_PROCESS_SILENCE;
   }
 
@@ -160,6 +167,10 @@ ae_process_result dispatch(void *state, const float *const *inputs, uint32_t inp
     result = stream->process(stream->user, &block);
   } catch (...) {
     result = AE_PROCESS_FAILED;
+  }
+  if (stream->backend->faults() != 0) {
+    silence();
+    return AE_PROCESS_SILENCE;
   }
   if (result != AE_PROCESS_OK) {
     silence();
@@ -201,6 +212,7 @@ ae_result enumerate_devices(const ae_context *context, ae_device_snapshot **out_
     info.display_name = snapshot->strings[string_index + 2].c_str();
     info.input_channels = device.input_channels;
     info.output_channels = device.output_channels;
+    info.channel_counts_known = device.channel_counts_known;
     snapshot->infos.push_back(info);
     string_index += 3;
   }
@@ -242,16 +254,20 @@ ae_result open_stream(ae_context *context, const ae_stream_request *request, ae_
   if (device == nullptr) {
     return AE_ERROR_NOT_FOUND;
   }
-  if (!valid_selection(request->input_channels, device->input_channels) ||
-      !valid_selection(request->output_channels, device->output_channels)) {
+  const uint32_t available_inputs =
+      device->channel_counts_known ? device->input_channels : AE_MAX_CHANNELS;
+  const uint32_t available_outputs =
+      device->channel_counts_known ? device->output_channels : AE_MAX_CHANNELS;
+  if (!valid_selection(request->input_channels, available_inputs) ||
+      !valid_selection(request->output_channels, available_outputs)) {
     return AE_ERROR_INVALID_ARGUMENT;
   }
   if (request->input_channels.mode == AE_CHANNEL_MODE_NONE &&
       request->output_channels.mode == AE_CHANNEL_MODE_NONE) {
     return AE_ERROR_UNSUPPORTED_CONFIGURATION;
   }
-  if ((request->input_channels.mode != AE_CHANNEL_MODE_NONE && device->input_channels == 0) ||
-      (request->output_channels.mode != AE_CHANNEL_MODE_NONE && device->output_channels == 0)) {
+  if ((request->input_channels.mode != AE_CHANNEL_MODE_NONE && available_inputs == 0) ||
+      (request->output_channels.mode != AE_CHANNEL_MODE_NONE && available_outputs == 0)) {
     return AE_ERROR_UNSUPPORTED_CONFIGURATION;
   }
   if (context->active_streams != 0) {
@@ -276,19 +292,18 @@ ae_result open_stream(ae_context *context, const ae_stream_request *request, ae_
   }
 
   auto reject = [&](ae_result code) {
-    context->backend->close();
-    return code;
+    const ae_result cleanup = context->backend->close();
+    return cleanup == AE_OK ? code : cleanup;
   };
 
-  if (actual.sample_rate == 0 || actual.frames_per_block == 0 ||
-      actual.max_frames_per_block < actual.frames_per_block ||
+  if (actual.sample_rate < kMinSampleRate || actual.sample_rate > AE_MAX_SAMPLE_RATE ||
+      actual.frames_per_block == 0 || actual.max_frames_per_block < actual.frames_per_block ||
       actual.frames_per_block > AE_MAX_FRAMES_PER_BLOCK ||
       actual.max_frames_per_block > AE_MAX_FRAMES_PER_BLOCK) {
     return reject(AE_ERROR_DRIVER_FAILURE);
   }
-  if (!expected_channel_count(request->input_channels, device->input_channels,
-                              actual.input_channels) ||
-      !expected_channel_count(request->output_channels, device->output_channels,
+  if (!expected_channel_count(request->input_channels, available_inputs, actual.input_channels) ||
+      !expected_channel_count(request->output_channels, available_outputs,
                               actual.output_channels)) {
     return reject(AE_ERROR_UNSUPPORTED_CONFIGURATION);
   }
@@ -299,12 +314,19 @@ ae_result open_stream(ae_context *context, const ae_stream_request *request, ae_
     }
   }
 
+  if (actual.input_map.size() != actual.input_channels ||
+      actual.output_map.size() != actual.output_channels) {
+    return reject(AE_ERROR_DRIVER_FAILURE);
+  }
+
   auto *stream = new (std::nothrow) ae_stream();
   if (stream == nullptr) {
     return reject(AE_ERROR_ALLOCATION_FAILURE);
   }
   stream->context = context;
   stream->backend = context->backend.get();
+  stream->inputs = std::move(actual.input_map);
+  stream->outputs = std::move(actual.output_map);
   stream->format.struct_size = sizeof(ae_stream_format);
   stream->format.sample_rate = actual.sample_rate;
   stream->format.frames_per_block = actual.frames_per_block;
@@ -345,7 +367,7 @@ ae_result ae_context_create(const ae_context_options *options, ae_context **out_
       return AE_ERROR_INCOMPATIBLE_ABI;
     }
     if (options->api_version_major != AE_API_VERSION_MAJOR ||
-        options->api_version_minor > AE_API_VERSION_MINOR) {
+        options->api_version_minor != AE_API_VERSION_MINOR) {
       return AE_ERROR_INCOMPATIBLE_ABI;
     }
     return ae::detail::create_context_with_backend(std::make_unique<EmptyBackend>(), out_context);
@@ -353,13 +375,115 @@ ae_result ae_context_create(const ae_context_options *options, ae_context **out_
 }
 
 ae_result ae_context_destroy(ae_context *context) {
-  if (context == nullptr) {
+  return call([&]() -> ae_result {
+    if (context == nullptr) {
+      return AE_ERROR_INVALID_ARGUMENT;
+    }
+    if (context->active_streams != 0 || context->snapshots != 0) {
+      return AE_ERROR_BUSY;
+    }
+    const ae_result result = context->backend->close();
+    if (result != AE_OK) {
+      return result;
+    }
+    delete context;
+    return AE_OK;
+  });
+}
+
+ae_result ae_context_refresh_devices(ae_context *context) {
+  return call([&]() -> ae_result {
+    if (context == nullptr) {
+      return AE_ERROR_INVALID_ARGUMENT;
+    }
+    return context->backend->refresh();
+  });
+}
+
+ae_result ae_context_get_diagnostic(const ae_context *context, ae_diagnostic *out) {
+  if (context == nullptr || out == nullptr) {
     return AE_ERROR_INVALID_ARGUMENT;
   }
-  if (context->active_streams != 0 || context->snapshots != 0) {
-    return AE_ERROR_BUSY;
+  if (!has_required_size(out)) {
+    return AE_ERROR_INCOMPATIBLE_ABI;
   }
-  delete context;
+  auto diagnostic = context->backend->diagnostic();
+  diagnostic.struct_size = out->struct_size;
+  *out = diagnostic;
+  return AE_OK;
+}
+
+ae_result ae_context_probe_device(ae_context *context, const char *backend_id,
+                                  const char *device_id, ae_capability_snapshot **out) {
+  return call([&]() -> ae_result {
+    if (out == nullptr) {
+      return AE_ERROR_INVALID_ARGUMENT;
+    }
+    *out = nullptr;
+    if (context == nullptr || !non_empty(backend_id) || !non_empty(device_id)) {
+      return AE_ERROR_INVALID_ARGUMENT;
+    }
+    if (context->active_streams != 0) {
+      return AE_ERROR_BUSY;
+    }
+    if (find_device(context, backend_id, device_id) == nullptr) {
+      return AE_ERROR_NOT_FOUND;
+    }
+    auto snapshot = std::make_unique<ae_capability_snapshot>();
+    const auto result = context->backend->probe(device_id, snapshot->capabilities);
+    if (result != AE_OK) {
+      return result;
+    }
+    snapshot->context = context;
+    ++context->snapshots;
+    *out = snapshot.release();
+    return AE_OK;
+  });
+}
+
+ae_result ae_capability_snapshot_get(const ae_capability_snapshot *snapshot,
+                                     ae_device_capabilities *out) {
+  if (snapshot == nullptr || out == nullptr) {
+    return AE_ERROR_INVALID_ARGUMENT;
+  }
+  if (!has_required_size(out)) {
+    return AE_ERROR_INCOMPATIBLE_ABI;
+  }
+  auto info = snapshot->capabilities.info;
+  info.struct_size = out->struct_size;
+  info.tested_rate_count = static_cast<uint32_t>(snapshot->capabilities.rates.size());
+  info.tested_rates = snapshot->capabilities.rates.data();
+  *out = info;
+  return AE_OK;
+}
+
+ae_result ae_capability_snapshot_get_channel(const ae_capability_snapshot *snapshot,
+                                             ae_direction direction, uint32_t index,
+                                             ae_channel_info *out) {
+  if (snapshot == nullptr || out == nullptr ||
+      (direction != AE_DIRECTION_INPUT && direction != AE_DIRECTION_OUTPUT)) {
+    return AE_ERROR_INVALID_ARGUMENT;
+  }
+  if (!has_required_size(out)) {
+    return AE_ERROR_INCOMPATIBLE_ABI;
+  }
+  const auto &channels = direction == AE_DIRECTION_INPUT ? snapshot->capabilities.inputs
+                                                         : snapshot->capabilities.outputs;
+  if (index >= channels.size()) {
+    return AE_ERROR_INVALID_ARGUMENT;
+  }
+  auto channel = channels[index];
+  channel.struct_size = out->struct_size;
+  *out = channel;
+  return AE_OK;
+}
+
+ae_result ae_capability_snapshot_release(ae_capability_snapshot *snapshot) {
+  if (snapshot == nullptr) {
+    return AE_ERROR_INVALID_ARGUMENT;
+  }
+  --snapshot->context->snapshots;
+  delete snapshot;
   return AE_OK;
 }
 
@@ -423,7 +547,8 @@ ae_result ae_stream_start(ae_stream *stream, ae_process_fn process, void *user) 
     if (stream == nullptr || process == nullptr) {
       return AE_ERROR_INVALID_ARGUMENT;
     }
-    if (stream->state.load(std::memory_order_acquire) != AE_STREAM_STATE_READY) {
+    if (stream->state.load(std::memory_order_acquire) != AE_STREAM_STATE_READY ||
+        stream->backend->faults() != 0) {
       return AE_ERROR_INVALID_STATE;
     }
 
@@ -436,6 +561,12 @@ ae_result ae_stream_start(ae_stream *stream, ae_process_fn process, void *user) 
     stream->state.store(AE_STREAM_STATE_RUNNING, std::memory_order_release);
 
     ae_result result = call([&] { return stream->backend->start(&dispatch, stream); });
+    if (result == AE_ERROR_QUIESCENCE_FAILURE) {
+      stream->failure_latched.store(true, std::memory_order_release);
+      stream->last_result.store(result, std::memory_order_relaxed);
+      stream->state.store(AE_STREAM_STATE_RECOVERY_REQUIRED, std::memory_order_release);
+      return result;
+    }
     if (result != AE_OK) {
       stream->run_generation.fetch_sub(1, std::memory_order_relaxed);
       stream->process = nullptr;
@@ -466,7 +597,9 @@ ae_result ae_stream_stop(ae_stream *stream) {
     stream->process = nullptr;
     stream->user = nullptr;
     stream->failure_latched.store(false, std::memory_order_relaxed);
-    stream->state.store(AE_STREAM_STATE_READY, std::memory_order_release);
+    stream->state.store(stream->backend->faults() == 0 ? AE_STREAM_STATE_READY
+                                                       : AE_STREAM_STATE_RECOVERY_REQUIRED,
+                        std::memory_order_release);
     return AE_OK;
   });
 }
@@ -487,6 +620,12 @@ ae_result ae_stream_get_status(const ae_stream *stream, ae_stream_status *out_st
   status.configuration_generation = stream->format.configuration_generation;
   status.run_generation = stream->run_generation.load(std::memory_order_relaxed);
   status.delivered_frames = stream->delivered_frames.load(std::memory_order_relaxed);
+  stream->backend->observations(status);
+  status.fault_flags = stream->backend->faults();
+  if (status.fault_flags != 0) {
+    status.state = AE_STREAM_STATE_RECOVERY_REQUIRED;
+    status.last_result = AE_ERROR_DEVICE_UNAVAILABLE;
+  }
   *out_status = status;
   return AE_OK;
 }
@@ -500,13 +639,30 @@ ae_result ae_stream_close(ae_stream *stream) {
       return AE_ERROR_QUIESCENCE_FAILURE;
     }
 
-    stream->backend->close();
+    const ae_result result = stream->backend->close();
+    if (result != AE_OK) {
+      return result;
+    }
     if (stream->context->active_streams > 0) {
       --stream->context->active_streams;
     }
     delete stream;
     return AE_OK;
   });
+}
+
+ae_result ae_stream_get_channel(const ae_stream *stream, ae_direction direction, uint32_t index,
+                                uint32_t *out) {
+  if (stream == nullptr || out == nullptr ||
+      (direction != AE_DIRECTION_INPUT && direction != AE_DIRECTION_OUTPUT)) {
+    return AE_ERROR_INVALID_ARGUMENT;
+  }
+  const auto &channels = direction == AE_DIRECTION_INPUT ? stream->inputs : stream->outputs;
+  if (index >= channels.size()) {
+    return AE_ERROR_INVALID_ARGUMENT;
+  }
+  *out = channels[index];
+  return AE_OK;
 }
 }
 

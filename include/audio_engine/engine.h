@@ -9,7 +9,8 @@ extern "C" {
 #endif
 
 #define AE_API_VERSION_MAJOR 0u
-#define AE_API_VERSION_MINOR 1u
+#define AE_API_VERSION_MINOR 2u
+#define AE_MAX_CHANNELS 256u
 #define AE_MAX_SAMPLE_RATE 768000u
 #define AE_MAX_FRAMES_PER_BLOCK 65536u
 
@@ -53,6 +54,46 @@ enum { AE_PROCESS_OK = 0, AE_PROCESS_SILENCE = 1, AE_PROCESS_FAILED = 2 };
 typedef struct ae_context ae_context;
 typedef struct ae_stream ae_stream;
 typedef struct ae_device_snapshot ae_device_snapshot;
+typedef struct ae_capability_snapshot ae_capability_snapshot;
+
+typedef int32_t ae_direction;
+enum { AE_DIRECTION_INPUT = 0, AE_DIRECTION_OUTPUT = 1 };
+enum {
+  AE_FAULT_RESET = 1u,
+  AE_FAULT_SAMPLE_RATE = 2u,
+  AE_FAULT_RESYNC = 4u,
+  AE_FAULT_DEVICE = 8u,
+  AE_FAULT_CALLBACK = 16u
+};
+
+typedef struct ae_channel_info {
+  uint32_t struct_size;
+  uint32_t index;
+  int32_t native_format;
+  uint32_t supported;
+  char name[64];
+} ae_channel_info;
+
+typedef struct ae_device_capabilities {
+  uint32_t struct_size;
+  uint32_t input_channels;
+  uint32_t output_channels;
+  uint32_t current_sample_rate;
+  uint32_t min_frames;
+  uint32_t max_frames;
+  uint32_t preferred_frames;
+  int32_t frame_granularity;
+  uint32_t tested_rate_count;
+  const uint32_t *tested_rates;
+} ae_device_capabilities;
+
+typedef struct ae_diagnostic {
+  uint32_t struct_size;
+  ae_result result;
+  int64_t native_code;
+  char operation[64];
+  char message[256];
+} ae_diagnostic;
 
 typedef struct ae_context_options {
   uint32_t struct_size;
@@ -68,6 +109,7 @@ typedef struct ae_device_info {
   const char *display_name;
   uint32_t input_channels;
   uint32_t output_channels;
+  uint32_t channel_counts_known;
 } ae_device_info;
 
 typedef struct ae_channel_selection {
@@ -122,11 +164,29 @@ typedef struct ae_stream_status {
   uint32_t configuration_generation;
   uint32_t run_generation;
   uint64_t delivered_frames;
+  uint32_t fault_flags;
+  uint32_t latency_valid;
+  uint32_t input_latency_frames;
+  uint32_t output_latency_frames;
+  uint64_t callback_count;
+  uint64_t max_callback_nanoseconds;
+  uint64_t deadline_overruns;
+  uint64_t driver_overloads;
 } ae_stream_status;
 
 ae_result ae_get_api_version(uint32_t *out_major, uint32_t *out_minor);
 ae_result ae_context_create(const ae_context_options *options, ae_context **out_context);
 ae_result ae_context_destroy(ae_context *context);
+ae_result ae_context_refresh_devices(ae_context *context);
+ae_result ae_context_get_diagnostic(const ae_context *context, ae_diagnostic *out_diagnostic);
+ae_result ae_context_probe_device(ae_context *context, const char *backend_id,
+                                  const char *device_id, ae_capability_snapshot **out_snapshot);
+ae_result ae_capability_snapshot_get(const ae_capability_snapshot *snapshot,
+                                     ae_device_capabilities *out_capabilities);
+ae_result ae_capability_snapshot_get_channel(const ae_capability_snapshot *snapshot,
+                                             ae_direction direction, uint32_t index,
+                                             ae_channel_info *out_info);
+ae_result ae_capability_snapshot_release(ae_capability_snapshot *snapshot);
 ae_result ae_context_enumerate_devices(const ae_context *context,
                                        ae_device_snapshot **out_snapshot);
 uint32_t ae_device_snapshot_count(const ae_device_snapshot *snapshot);
@@ -136,6 +196,8 @@ ae_result ae_device_snapshot_release(ae_device_snapshot *snapshot);
 ae_result ae_stream_open(ae_context *context, const ae_stream_request *request,
                          ae_stream **out_stream, ae_stream_format *out_format);
 ae_result ae_stream_get_format(const ae_stream *stream, ae_stream_format *out_format);
+ae_result ae_stream_get_channel(const ae_stream *stream, ae_direction direction, uint32_t index,
+                                uint32_t *out_physical_index);
 ae_result ae_stream_start(ae_stream *stream, ae_process_fn process, void *user);
 ae_result ae_stream_stop(ae_stream *stream);
 ae_result ae_stream_get_status(const ae_stream *stream, ae_stream_status *out_status);

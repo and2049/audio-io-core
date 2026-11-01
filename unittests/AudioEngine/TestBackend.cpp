@@ -82,11 +82,22 @@ ae_result TestBackend::open(const ae::OpenRequest &request, ae::ActualFormat &ac
   actual.max_frames_per_block = frames;
   actual.input_channels = resolve_channels(request.inputs, devices_[0].input_channels);
   actual.output_channels = resolve_channels(request.outputs, devices_[0].output_channels);
+  for (uint32_t i = 0; i < actual.input_channels; ++i) {
+    actual.input_map.push_back(
+        request.inputs.mode == AE_CHANNEL_MODE_EXPLICIT ? request.inputs.indices[i] : i);
+  }
+  for (uint32_t i = 0; i < actual.output_channels; ++i) {
+    actual.output_map.push_back(
+        request.outputs.mode == AE_CHANNEL_MODE_EXPLICIT ? request.outputs.indices[i] : i);
+  }
   actual_ = actual;
   return AE_OK;
 }
 
 ae_result TestBackend::start(ae::BackendProcessFn process, void *engine_state) {
+  if (std::exchange(retained_start_failure_, false)) {
+    return AE_ERROR_QUIESCENCE_FAILURE;
+  }
   if (running_.load(std::memory_order_acquire)) {
     return AE_ERROR_INVALID_STATE;
   }
@@ -124,7 +135,35 @@ ae_result TestBackend::stop() {
   return AE_OK;
 }
 
-void TestBackend::close() noexcept { actual_ = {}; }
+ae_result TestBackend::close() {
+  if (std::exchange(close_failure_, false)) {
+    return AE_ERROR_DRIVER_FAILURE;
+  }
+  actual_ = {};
+  faults_.store(0);
+  return AE_OK;
+}
+
+ae_result TestBackend::probe(const std::string &id, ae::Capabilities &capabilities) {
+  if (id != "test-duplex") {
+    return AE_ERROR_NOT_FOUND;
+  }
+  capabilities.info.input_channels = 2;
+  capabilities.info.output_channels = 2;
+  capabilities.info.current_sample_rate = 48000;
+  capabilities.info.min_frames = 64;
+  capabilities.info.max_frames = 256;
+  capabilities.info.preferred_frames = 128;
+  capabilities.info.frame_granularity = -1;
+  capabilities.rates = {44100, 48000, 96000};
+  capabilities.inputs.resize(2);
+  capabilities.outputs.resize(2);
+  for (uint32_t i = 0; i < 2; ++i) {
+    capabilities.inputs[i].index = i;
+    capabilities.outputs[i].index = i;
+  }
+  return AE_OK;
+}
 
 void TestBackend::run() {
   const uint32_t input_channels = actual_.input_channels;

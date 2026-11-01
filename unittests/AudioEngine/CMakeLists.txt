@@ -1,5 +1,12 @@
 find_package(Threads REQUIRED)
 
+add_executable(AudioEngineCapabilitiesTest CapabilitiesTest.cpp)
+target_link_libraries(AudioEngineCapabilitiesTest PRIVATE AudioEngineTestBackend)
+target_compile_features(AudioEngineCapabilitiesTest PRIVATE cxx_std_20)
+audio_engine_set_warnings(AudioEngineCapabilitiesTest)
+add_test(NAME AudioEngine.Capabilities COMMAND AudioEngineCapabilitiesTest)
+set_tests_properties(AudioEngine.Capabilities PROPERTIES TIMEOUT 30)
+
 add_library(AudioEngineTestBackend STATIC TestBackend.cpp)
 target_link_libraries(AudioEngineTestBackend PUBLIC audio_engine::audio_engine Threads::Threads)
 target_include_directories(AudioEngineTestBackend PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"

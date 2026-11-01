@@ -22,7 +22,12 @@ public:
   ae_result open(const ae::OpenRequest &request, ae::ActualFormat &actual) override;
   ae_result start(ae::BackendProcessFn process, void *engine_state) override;
   ae_result stop() override;
-  void close() noexcept override;
+  ae_result close() override;
+  ae_result probe(const std::string &, ae::Capabilities &) override;
+  uint32_t faults() const noexcept override { return faults_.load(); }
+  void invalidate() { faults_.store(AE_FAULT_RESET); }
+  void setCloseFailure() { close_failure_ = true; }
+  void setRetainedStartFailure() { retained_start_failure_ = true; }
 
   void setIgnoreExactNegotiation(bool value) {
     ignore_exact_negotiation_.store(value, std::memory_order_relaxed);
@@ -44,6 +49,9 @@ private:
   Failure start_failure_ = Failure::None;
   Failure stop_failure_ = Failure::None;
   uint64_t frame_position_ = 0;
+  std::atomic<uint32_t> faults_{0};
+  bool close_failure_ = false;
+  bool retained_start_failure_ = false;
 };
 
 #endif

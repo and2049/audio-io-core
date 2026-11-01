@@ -15,6 +15,14 @@ struct Device {
   std::string display_name;
   uint32_t input_channels = 0;
   uint32_t output_channels = 0;
+  bool channel_counts_known = true;
+};
+
+struct Capabilities {
+  ae_device_capabilities info{};
+  std::vector<uint32_t> rates;
+  std::vector<ae_channel_info> inputs;
+  std::vector<ae_channel_info> outputs;
 };
 
 struct ChannelSelection {
@@ -38,6 +46,8 @@ struct ActualFormat {
   uint32_t max_frames_per_block = 0;
   uint32_t input_channels = 0;
   uint32_t output_channels = 0;
+  std::vector<uint32_t> input_map;
+  std::vector<uint32_t> output_map;
 };
 
 using BackendProcessFn = ae_process_result (*)(void *engine_state, const float *const *inputs,
@@ -50,10 +60,15 @@ public:
   virtual ~Backend() = default;
 
   virtual const std::vector<Device> &devices() const = 0;
+  virtual ae_result refresh() { return AE_OK; }
+  virtual ae_result probe(const std::string &, Capabilities &) { return AE_ERROR_UNSUPPORTED; }
+  virtual uint32_t faults() const noexcept { return 0; }
+  virtual void observations(ae_stream_status &) const noexcept {}
+  virtual ae_diagnostic diagnostic() const noexcept { return {}; }
   virtual ae_result open(const OpenRequest &request, ActualFormat &actual) = 0;
   virtual ae_result start(BackendProcessFn process, void *engine_state) = 0;
   virtual ae_result stop() = 0;
-  virtual void close() noexcept = 0;
+  virtual ae_result close() = 0;
 };
 
 }
