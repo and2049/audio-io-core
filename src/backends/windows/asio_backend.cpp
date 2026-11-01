@@ -513,6 +513,9 @@ private:
     caps.info.max_frames = static_cast<uint32_t>(maximum);
     caps.info.preferred_frames = static_cast<uint32_t>(preferred);
     caps.info.frame_granularity = granularity;
+    if (granularity == 0 && minimum != maximum) {
+      return fail("fixed buffer bounds", 0);
+    }
     if (!valid_frames(caps.info.preferred_frames, caps.info)) {
       return fail("preferred buffer", 0);
     }
@@ -807,6 +810,20 @@ ae_result AsioBackend::open_owned(const OpenRequest &request, ActualFormat &actu
   for (const auto &buffer : buffers_) {
     if (buffer.buffers[0] == nullptr || buffer.buffers[1] == nullptr) {
       return fail("buffer pointers", 0);
+    }
+  }
+  ASIOSampleRate final_rate = 0;
+  const ASIOError queried = driver_->getSampleRate(&final_rate);
+  if (queried != ASE_OK || final_rate != rate_) {
+    return fail("rate changed during buffer creation", queried, AE_ERROR_UNSUPPORTED_CONFIGURATION);
+  }
+  for (size_t i = 0; i < buffers_.size(); ++i) {
+    const bool input = i < actual.input_map.size();
+    const uint32_t expected =
+        input ? actual.input_map[i] : actual.output_map[i - actual.input_map.size()];
+    if (buffers_[i].channelNum != static_cast<long>(expected) ||
+        buffers_[i].isInput != (input ? ASIOTrue : ASIOFalse)) {
+      return fail("channel mapping changed during buffer creation", 0);
     }
   }
   clear_outputs(0);

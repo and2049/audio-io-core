@@ -1,11 +1,44 @@
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <vector>
 
 #include "Check.h"
 #include "backends/windows/asio_backend.h"
 #include "testing_api.h"
+
+thread_local bool forbid_allocation = false;
+
+void *operator new(size_t size) {
+  AE_CHECK(!forbid_allocation);
+  void *pointer = std::malloc(size == 0 ? 1 : size);
+  if (pointer == nullptr) {
+    throw std::bad_alloc();
+  }
+  return pointer;
+}
+void *operator new[](size_t size) { return ::operator new(size); }
+void operator delete(void *pointer) noexcept { std::free(pointer); }
+void operator delete[](void *pointer) noexcept { std::free(pointer); }
+void operator delete(void *pointer, size_t) noexcept { std::free(pointer); }
+void operator delete[](void *pointer, size_t) noexcept { std::free(pointer); }
+void *operator new(size_t size, std::align_val_t alignment) {
+  AE_CHECK(!forbid_allocation);
+  void *pointer = _aligned_malloc(size == 0 ? 1 : size, static_cast<size_t>(alignment));
+  if (pointer == nullptr) {
+    throw std::bad_alloc();
+  }
+  return pointer;
+}
+void *operator new[](size_t size, std::align_val_t alignment) {
+  return ::operator new(size, alignment);
+}
+void operator delete(void *pointer, std::align_val_t) noexcept { _aligned_free(pointer); }
+void operator delete[](void *pointer, std::align_val_t) noexcept { _aligned_free(pointer); }
+void operator delete(void *pointer, size_t, std::align_val_t) noexcept { _aligned_free(pointer); }
+void operator delete[](void *pointer, size_t, std::align_val_t) noexcept { _aligned_free(pointer); }
 
 namespace {
 constexpr const char *identity = "{AC4D0455-50D7-4498-B3CD-9A41D130B759}";
@@ -15,6 +48,9 @@ struct State {
   uint32_t activations = 0, releases = 0, disposals = 0;
   bool fail_init = false, fail_create = false, fail_start = false, fail_stop = false;
   bool fail_dispose = false, threaded = false, null_buffer = false;
+  bool change_rate_during_create = false, change_map_during_create = false;
+  long minimum = 64, maximum = 256, preferred = 128, granularity = -1;
+  std::atomic<bool> stop_entered{false};
   ASIOBool direct = ASIOTrue;
   ASIOSampleType type = ASIOSTInt32LSB;
   ASIOCallbacks callbacks{};
@@ -50,12 +86,16 @@ public:
     if (state.threaded) {
       thread_ = std::thread([] { state.callbacks.bufferSwitch(0, state.direct); });
     } else {
+      forbid_allocation = true;
       state.callbacks.bufferSwitch(0, state.direct);
+      forbid_allocation = false;
     }
     return state.fail_start ? ASE_HWMalfunction : ASE_OK;
   }
   ASIOError stop() override {
     control_thread();
+    state.stop_entered.store(true);
+    state.stop_entered.notify_all();
     if (state.fail_stop) {
       return ASE_HWMalfunction;
     }
@@ -78,10 +118,10 @@ public:
   }
   ASIOError getBufferSize(long *min, long *max, long *preferred, long *granularity) override {
     control_thread();
-    *min = 64;
-    *max = 256;
-    *preferred = 128;
-    *granularity = -1;
+    *min = state.minimum;
+    *max = state.maximum;
+    *preferred = state.preferred;
+    *granularity = state.granularity;
     return ASE_OK;
   }
   ASIOError canSampleRate(ASIOSampleRate rate) override {
@@ -122,6 +162,12 @@ public:
       }
     }
     state.buffers.assign(buffers, buffers + channels);
+    if (state.change_rate_during_create) {
+      rate_ = 96000;
+    }
+    if (state.change_map_during_create) {
+      buffers[0].channelNum = 0;
+    }
     return state.fail_create ? ASE_NoMemory : ASE_OK;
   }
   ASIOError disposeBuffers() override {
@@ -256,6 +302,23 @@ void failures() {
   spec.frames_per_block = 100;
   AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_UNSUPPORTED_CONFIGURATION);
   spec.frames_per_block = 128;
+  state.granularity = 0;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
+  state.granularity = 16;
+  spec.frames_per_block = 112;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  AE_CHECK(format.frames_per_block == 112);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  spec.frames_per_block = 113;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_UNSUPPORTED_CONFIGURATION);
+  spec.frames_per_block = 128;
+  state.granularity = -1;
+  state.change_rate_during_create = true;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_UNSUPPORTED_CONFIGURATION);
+  state.change_rate_during_create = false;
+  state.change_map_during_create = true;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
+  state.change_map_during_create = false;
   state.fail_create = true;
   state.fail_dispose = true;
   AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
@@ -307,9 +370,20 @@ void in_flight_stop() {
     processor.entered.wait(false);
   }
   state.callbacks.sampleRateDidChange(96000);
+  state.stop_entered.store(false);
+  std::atomic<bool> stopped{false};
+  std::thread stopper([&] {
+    AE_CHECK(ae_stream_stop(stream) == AE_OK);
+    stopped.store(true);
+  });
+  while (!state.stop_entered.load()) {
+    state.stop_entered.wait(false);
+  }
+  AE_CHECK(!stopped.load());
   processor.release.store(true);
   processor.release.notify_all();
-  AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  stopper.join();
+  AE_CHECK(stopped.load());
   AE_CHECK(state.storage[2][0] == 0);
   AE_CHECK(ae_stream_close(stream) == AE_OK);
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
