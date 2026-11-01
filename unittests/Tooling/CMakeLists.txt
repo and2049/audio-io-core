@@ -1,0 +1,10 @@
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_test(NAME AudioEngine.IRTooling
+    COMMAND "${CMAKE_COMMAND}"
+      "-DCLANG=${CMAKE_CXX_COMPILER}"
+      "-DCL_MODE=${MSVC}"
+      "-DENGINE_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+      "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/IR fixture"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/VerifyIR.cmake"
+  )
+endif()
