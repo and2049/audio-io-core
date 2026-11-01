@@ -22,3 +22,5 @@ target_compile_features(audio_engine PRIVATE cxx_std_20)
 target_include_directories(audio_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(audio_engine PROPERTIES CXX_EXTENSIONS OFF)
 audio_engine_set_warnings(audio_engine)
+
+include(tools/DeveloperTools.cmake)
