@@ -1,5 +1,11 @@
 find_package(Threads REQUIRED)
 
+add_executable(AudioEngineConversionTest ConversionTest.cpp)
+target_link_libraries(AudioEngineConversionTest PRIVATE AudioEngineTestBackend)
+target_compile_features(AudioEngineConversionTest PRIVATE cxx_std_20)
+audio_engine_set_warnings(AudioEngineConversionTest)
+add_test(NAME AudioEngine.Conversion COMMAND AudioEngineConversionTest)
+
 add_executable(AudioEngineCapabilitiesTest CapabilitiesTest.cpp)
 target_link_libraries(AudioEngineCapabilitiesTest PRIVATE AudioEngineTestBackend)
 target_compile_features(AudioEngineCapabilitiesTest PRIVATE cxx_std_20)

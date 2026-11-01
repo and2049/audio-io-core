@@ -26,7 +26,7 @@ function(audio_engine_set_warnings target)
   endif()
 endfunction()
 
-add_library(audio_engine STATIC src/engine.cpp)
+add_library(audio_engine STATIC src/engine.cpp src/sample_conversion.cpp)
 add_library(audio_engine::audio_engine ALIAS audio_engine)
 target_compile_features(audio_engine PRIVATE cxx_std_20)
 target_include_directories(audio_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
