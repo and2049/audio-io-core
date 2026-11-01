@@ -3,6 +3,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <new>
+#include <stdexcept>
+#include <utility>
+
+#include "Check.h"
 
 namespace {
 
@@ -21,6 +26,20 @@ uint32_t resolve_channels(const ae::ChannelSelection &selection, uint32_t availa
     return available;
   }
   return static_cast<uint32_t>(selection.indices.size());
+}
+
+ae_result consumeFailure(TestBackend::Failure &failure) {
+  switch (std::exchange(failure, TestBackend::Failure::None)) {
+  case TestBackend::Failure::Error:
+    return AE_ERROR_DRIVER_FAILURE;
+  case TestBackend::Failure::Exception:
+    throw std::runtime_error("test backend failure");
+  case TestBackend::Failure::Allocation:
+    throw std::bad_alloc();
+  case TestBackend::Failure::None:
+    return AE_OK;
+  }
+  return AE_ERROR_DRIVER_FAILURE;
 }
 
 }
@@ -71,8 +90,8 @@ ae_result TestBackend::start(ae::BackendProcessFn process, void *engine_state) {
   if (running_.load(std::memory_order_acquire)) {
     return AE_ERROR_INVALID_STATE;
   }
-  if (fail_next_start_.exchange(false, std::memory_order_relaxed)) {
-    return AE_ERROR_DRIVER_FAILURE;
+  if (ae_result result = consumeFailure(start_failure_); result != AE_OK) {
+    return result;
   }
 
   process_ = process;
@@ -80,11 +99,21 @@ ae_result TestBackend::start(ae::BackendProcessFn process, void *engine_state) {
   frame_position_ = 0;
   stop_requested_.store(false, std::memory_order_relaxed);
   running_.store(true, std::memory_order_release);
-  thread_ = std::thread(&TestBackend::run, this);
+  try {
+    thread_ = std::thread(&TestBackend::run, this);
+  } catch (...) {
+    running_.store(false, std::memory_order_release);
+    process_ = nullptr;
+    engine_state_ = nullptr;
+    throw;
+  }
   return AE_OK;
 }
 
 ae_result TestBackend::stop() {
+  if (ae_result result = consumeFailure(stop_failure_); result != AE_OK) {
+    return result;
+  }
   stop_requested_.store(true, std::memory_order_release);
   if (thread_.joinable()) {
     thread_.join();
@@ -95,14 +124,14 @@ ae_result TestBackend::stop() {
   return AE_OK;
 }
 
-void TestBackend::close() { actual_ = {}; }
+void TestBackend::close() noexcept { actual_ = {}; }
 
 void TestBackend::run() {
   const uint32_t input_channels = actual_.input_channels;
   const uint32_t output_channels = actual_.output_channels;
   const uint32_t frames = actual_.frames_per_block;
 
-  std::vector<float> input(static_cast<size_t>(input_channels) * frames, 0.0f);
+  std::vector<float> input(static_cast<size_t>(input_channels) * frames, 0.25f);
   std::vector<float> output(static_cast<size_t>(output_channels) * frames, 0.0f);
   std::vector<const float *> inputs(input_channels);
   std::vector<float *> outputs(output_channels);
@@ -119,7 +148,8 @@ void TestBackend::run() {
         engine_state_, input_channels == 0 ? nullptr : inputs.data(), input_channels,
         output_channels == 0 ? nullptr : outputs.data(), output_channels, frames, frame_position_);
     if (result != AE_PROCESS_OK) {
-      std::fill(output.begin(), output.end(), 0.0f);
+      AE_CHECK(
+          std::all_of(output.begin(), output.end(), [](float sample) { return sample == 0.0f; }));
     }
     frame_position_ += frames;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));

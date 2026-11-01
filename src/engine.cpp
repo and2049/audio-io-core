@@ -123,7 +123,7 @@ public:
   }
   ae_result start(ae::BackendProcessFn, void *) override { return AE_ERROR_INVALID_STATE; }
   ae_result stop() override { return AE_OK; }
-  void close() override {}
+  void close() noexcept override {}
 
 private:
   std::vector<ae::Device> devices_;
@@ -131,11 +131,14 @@ private:
 
 ae_process_result dispatch(void *state, const float *const *inputs, uint32_t input_channels,
                            float *const *outputs, uint32_t output_channels, uint32_t frames,
-                           uint64_t frame_position) {
+                           uint64_t frame_position) noexcept {
   auto *stream = static_cast<ae_stream *>(state);
-  for (uint32_t channel = 0; channel < output_channels; ++channel) {
-    std::fill_n(outputs[channel], frames, 0.0f);
-  }
+  auto silence = [&] {
+    for (uint32_t channel = 0; channel < output_channels; ++channel) {
+      std::fill_n(outputs[channel], frames, 0.0f);
+    }
+  };
+  silence();
   if (stream->failure_latched.load(std::memory_order_acquire)) {
     return AE_PROCESS_SILENCE;
   }
@@ -152,7 +155,15 @@ ae_process_result dispatch(void *state, const float *const *inputs, uint32_t inp
   block.run_generation = stream->run_generation.load(std::memory_order_relaxed);
   block.frame_position = frame_position;
 
-  ae_process_result result = stream->process(stream->user, &block);
+  ae_process_result result;
+  try {
+    result = stream->process(stream->user, &block);
+  } catch (...) {
+    result = AE_PROCESS_FAILED;
+  }
+  if (result != AE_PROCESS_OK) {
+    silence();
+  }
   if (result != AE_PROCESS_OK && result != AE_PROCESS_SILENCE) {
     stream->last_result.store(AE_ERROR_PROCESSOR_FAILURE, std::memory_order_relaxed);
     stream->failure_latched.store(true, std::memory_order_release);
@@ -424,11 +435,14 @@ ae_result ae_stream_start(ae_stream *stream, ae_process_fn process, void *user) 
     stream->run_generation.fetch_add(1, std::memory_order_relaxed);
     stream->state.store(AE_STREAM_STATE_RUNNING, std::memory_order_release);
 
-    ae_result result = stream->backend->start(&dispatch, stream);
+    ae_result result = call([&] { return stream->backend->start(&dispatch, stream); });
     if (result != AE_OK) {
       stream->run_generation.fetch_sub(1, std::memory_order_relaxed);
       stream->process = nullptr;
       stream->user = nullptr;
+      stream->failure_latched.store(false, std::memory_order_relaxed);
+      stream->delivered_frames.store(0, std::memory_order_relaxed);
+      stream->last_result.store(result, std::memory_order_relaxed);
       stream->state.store(AE_STREAM_STATE_READY, std::memory_order_release);
     }
     return result;
@@ -444,8 +458,9 @@ ae_result ae_stream_stop(ae_stream *stream) {
       return AE_OK;
     }
 
-    ae_result result = stream->backend->stop();
+    ae_result result = call([&] { return stream->backend->stop(); });
     if (result != AE_OK) {
+      stream->last_result.store(result, std::memory_order_relaxed);
       return result;
     }
     stream->process = nullptr;
@@ -481,12 +496,8 @@ ae_result ae_stream_close(ae_stream *stream) {
     if (stream == nullptr) {
       return AE_ERROR_INVALID_ARGUMENT;
     }
-    if (stream->state.load(std::memory_order_acquire) != AE_STREAM_STATE_READY) {
-      ae_result result = stream->backend->stop();
-      if (result != AE_OK) {
-        stream->last_result.store(result, std::memory_order_relaxed);
-        return AE_ERROR_QUIESCENCE_FAILURE;
-      }
+    if (ae_stream_stop(stream) != AE_OK) {
+      return AE_ERROR_QUIESCENCE_FAILURE;
     }
 
     stream->backend->close();

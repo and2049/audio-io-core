@@ -10,6 +10,8 @@
 
 class TestBackend final : public ae::Backend {
 public:
+  enum class Failure { None, Error, Exception, Allocation };
+
   TestBackend();
   ~TestBackend() override;
 
@@ -20,12 +22,13 @@ public:
   ae_result open(const ae::OpenRequest &request, ae::ActualFormat &actual) override;
   ae_result start(ae::BackendProcessFn process, void *engine_state) override;
   ae_result stop() override;
-  void close() override;
+  void close() noexcept override;
 
   void setIgnoreExactNegotiation(bool value) {
     ignore_exact_negotiation_.store(value, std::memory_order_relaxed);
   }
-  void setFailNextStart(bool value) { fail_next_start_.store(value, std::memory_order_relaxed); }
+  void setStartFailure(Failure failure) { start_failure_ = failure; }
+  void setStopFailure(Failure failure) { stop_failure_ = failure; }
 
 private:
   void run();
@@ -38,8 +41,9 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> running_{false};
   std::atomic<bool> ignore_exact_negotiation_{false};
-  std::atomic<bool> fail_next_start_{false};
-  uint32_t frame_position_ = 0;
+  Failure start_failure_ = Failure::None;
+  Failure stop_failure_ = Failure::None;
+  uint64_t frame_position_ = 0;
 };
 
 #endif

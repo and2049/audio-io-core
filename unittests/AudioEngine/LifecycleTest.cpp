@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -27,7 +28,8 @@ struct Recorder {
   std::atomic<uint32_t> calls{0};
   std::atomic<uint32_t> active{0};
   std::atomic<bool> invalid{false};
-  std::atomic<bool> fail{false};
+  std::atomic<ae_process_result> result{AE_PROCESS_OK};
+  std::atomic<bool> throw_exception{false};
   std::atomic<uint64_t> next_position{0};
   std::atomic<uint32_t> expected_frames{0};
   std::atomic<uint32_t> expected_inputs{0};
@@ -90,11 +92,6 @@ ae_process_result process(void *user, const ae_audio_block *block) {
   recorder->calls.fetch_add(1, std::memory_order_relaxed);
   recorder->active.fetch_add(1, std::memory_order_acq_rel);
 
-  if (recorder->fail.load(std::memory_order_relaxed)) {
-    recorder->active.fetch_sub(1, std::memory_order_acq_rel);
-    return AE_PROCESS_FAILED;
-  }
-
   bool valid = block != nullptr;
   if (valid) {
     valid = valid && block->struct_size >= sizeof(ae_audio_block);
@@ -139,7 +136,10 @@ ae_process_result process(void *user, const ae_audio_block *block) {
   }
 
   recorder->active.fetch_sub(1, std::memory_order_acq_rel);
-  return AE_OK;
+  if (recorder->throw_exception.load(std::memory_order_relaxed)) {
+    throw std::runtime_error("test processor failure");
+  }
+  return recorder->result.load(std::memory_order_relaxed);
 }
 
 void waitForCalls(Recorder &recorder, uint32_t count) {
@@ -246,7 +246,7 @@ void testLifecycleAndQuiescence() {
   AE_CHECK(ae_context_destroy(test.context) == AE_OK);
 }
 
-void testProcessorFailureLatches() {
+void testProcessorFailureLatches(ae_process_result result, bool throw_exception = false) {
   TestContext test = makeTestContext();
   ae_stream_request request = duplexRequest();
   ae_stream *stream = nullptr;
@@ -255,7 +255,8 @@ void testProcessorFailureLatches() {
 
   Recorder recorder;
   configureRecorder(recorder, format, 1);
-  recorder.fail = true;
+  recorder.result = result;
+  recorder.throw_exception = throw_exception;
   AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_OK);
   waitForState(stream, AE_STREAM_STATE_RECOVERY_REQUIRED);
 
@@ -277,7 +278,8 @@ void testProcessorFailureLatches() {
   AE_CHECK(status.last_result == AE_ERROR_PROCESSOR_FAILURE);
   AE_CHECK(recorder.calls.load(std::memory_order_acquire) == 1);
 
-  recorder.fail = false;
+  recorder.result = AE_PROCESS_OK;
+  recorder.throw_exception = false;
   recorder.expected_run = 2;
   recorder.next_position = 0;
   AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_OK);
@@ -288,7 +290,7 @@ void testProcessorFailureLatches() {
   AE_CHECK(ae_context_destroy(test.context) == AE_OK);
 }
 
-void testFailedStartKeepsReady() {
+void testSilenceDiscardsOutput() {
   TestContext test = makeTestContext();
   ae_stream_request request = duplexRequest();
   ae_stream *stream = nullptr;
@@ -297,20 +299,86 @@ void testFailedStartKeepsReady() {
 
   Recorder recorder;
   configureRecorder(recorder, format, 1);
-  test.backend->setFailNextStart(true);
-  AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_ERROR_DRIVER_FAILURE);
+  recorder.result = AE_PROCESS_SILENCE;
+  AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_OK);
+  waitForDelivered(stream, 3 * format.frames_per_block);
+  ae_stream_status status = emptyStatus();
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
+  AE_CHECK(status.state == AE_STREAM_STATE_RUNNING);
+  AE_CHECK(status.last_result == AE_OK);
+  AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  AE_CHECK(recorder.calls.load() >= 3);
+  AE_CHECK(!recorder.invalid.load());
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(test.context) == AE_OK);
+}
+
+void testFailedStartKeepsReady(TestBackend::Failure failure) {
+  TestContext test = makeTestContext();
+  ae_stream_request request = duplexRequest();
+  ae_stream *stream = nullptr;
+  ae_stream_format format = emptyFormat();
+  AE_CHECK(ae_stream_open(test.context, &request, &stream, &format) == AE_OK);
+
+  Recorder recorder;
+  configureRecorder(recorder, format, 1);
+  test.backend->setStartFailure(failure);
+  const ae_result expected = failure == TestBackend::Failure::Allocation
+                                 ? AE_ERROR_ALLOCATION_FAILURE
+                                 : AE_ERROR_DRIVER_FAILURE;
+  AE_CHECK(ae_stream_start(stream, process, &recorder) == expected);
 
   ae_stream_status status = emptyStatus();
   AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
   AE_CHECK(status.state == AE_STREAM_STATE_READY);
   AE_CHECK(status.run_generation == 0);
+  AE_CHECK(status.last_result == expected);
+  AE_CHECK(status.delivered_frames == 0);
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   AE_CHECK(recorder.calls.load(std::memory_order_acquire) == 0);
 
   AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_OK);
   waitForCalls(recorder, 2);
   AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  AE_CHECK(!recorder.invalid.load());
   AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(test.context) == AE_OK);
+}
+
+void testFailedShutdownRetainsBinding(TestBackend::Failure failure) {
+  TestContext test = makeTestContext();
+  ae_stream_request request = duplexRequest();
+  ae_stream *stream = nullptr;
+  ae_stream_format format = emptyFormat();
+  AE_CHECK(ae_stream_open(test.context, &request, &stream, &format) == AE_OK);
+
+  Recorder recorder;
+  configureRecorder(recorder, format, 1);
+  AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_OK);
+  waitForCalls(recorder, 2);
+
+  const ae_result expected = failure == TestBackend::Failure::Allocation
+                                 ? AE_ERROR_ALLOCATION_FAILURE
+                                 : AE_ERROR_DRIVER_FAILURE;
+  test.backend->setStopFailure(failure);
+  AE_CHECK(ae_stream_stop(stream) == expected);
+  ae_stream_status status = emptyStatus();
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
+  AE_CHECK(status.state == AE_STREAM_STATE_RUNNING);
+  AE_CHECK(status.last_result == expected);
+
+  test.backend->setStopFailure(failure);
+  AE_CHECK(ae_stream_close(stream) == AE_ERROR_QUIESCENCE_FAILURE);
+  AE_CHECK(ae_context_destroy(test.context) == AE_ERROR_BUSY);
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
+  AE_CHECK(status.state == AE_STREAM_STATE_RUNNING);
+  AE_CHECK(status.last_result == expected);
+  AE_CHECK(ae_stream_start(stream, process, &recorder) == AE_ERROR_INVALID_STATE);
+  waitForCalls(recorder, recorder.calls.load() + 2);
+
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(recorder.active.load() == 0);
+  AE_CHECK(!recorder.invalid.load());
   AE_CHECK(ae_context_destroy(test.context) == AE_OK);
 }
 
@@ -361,8 +429,15 @@ void testOutputOnlyCallback() {
 
 int main() {
   testLifecycleAndQuiescence();
-  testProcessorFailureLatches();
-  testFailedStartKeepsReady();
+  testSilenceDiscardsOutput();
+  testProcessorFailureLatches(AE_PROCESS_FAILED);
+  testProcessorFailureLatches(99);
+  testProcessorFailureLatches(AE_PROCESS_OK, true);
+  for (TestBackend::Failure failure : {TestBackend::Failure::Error, TestBackend::Failure::Exception,
+                                       TestBackend::Failure::Allocation}) {
+    testFailedStartKeepsReady(failure);
+    testFailedShutdownRetainsBinding(failure);
+  }
   testCloseStopsRunningStream();
   testOutputOnlyCallback();
   return 0;

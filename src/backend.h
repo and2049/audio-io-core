@@ -43,7 +43,7 @@ struct ActualFormat {
 using BackendProcessFn = ae_process_result (*)(void *engine_state, const float *const *inputs,
                                                uint32_t input_channels, float *const *outputs,
                                                uint32_t output_channels, uint32_t frames,
-                                               uint64_t frame_position);
+                                               uint64_t frame_position) noexcept;
 
 class Backend {
 public:
@@ -53,7 +53,7 @@ public:
   virtual ae_result open(const OpenRequest &request, ActualFormat &actual) = 0;
   virtual ae_result start(BackendProcessFn process, void *engine_state) = 0;
   virtual ae_result stop() = 0;
-  virtual void close() = 0;
+  virtual void close() noexcept = 0;
 };
 
 }
