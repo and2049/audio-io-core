@@ -49,6 +49,7 @@ struct State {
   bool fail_init = false, fail_create = false, fail_start = false, fail_stop = false;
   bool fail_dispose = false, threaded = false, null_buffer = false;
   bool change_rate_during_create = false, change_map_during_create = false;
+  bool early_stop = false;
   long minimum = 64, maximum = 256, preferred = 128, granularity = -1;
   std::atomic<bool> stop_entered{false};
   ASIOBool direct = ASIOTrue;
@@ -67,6 +68,9 @@ public:
   ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
   ULONG STDMETHODCALLTYPE Release() override {
     control_thread();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
     ++state.releases;
     delete this;
     return 0;
@@ -99,7 +103,7 @@ public:
     if (state.fail_stop) {
       return ASE_HWMalfunction;
     }
-    if (thread_.joinable()) {
+    if (thread_.joinable() && !state.early_stop) {
       thread_.join();
     }
     return ASE_OK;
@@ -272,6 +276,7 @@ void lifecycle() {
   status.struct_size = sizeof(status);
   AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
   AE_CHECK(status.fault_flags == AE_FAULT_RESET && status.latency_valid == 1);
+  AE_CHECK(status.last_result == AE_ERROR_CONFIGURATION_CHANGED);
   AE_CHECK(status.input_latency_frames == 32 && status.callback_count == 1);
   state.callbacks.bufferSwitch(1, ASIOTrue);
   AE_CHECK(processor.calls == 1 && state.storage[3][0] == 0);
@@ -335,6 +340,11 @@ void failures() {
   AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
   Processor processor;
   state.fail_start = true;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_ERROR_DRIVER_FAILURE);
+  ae_stream_status rollback{};
+  rollback.struct_size = sizeof(rollback);
+  AE_CHECK(ae_stream_get_status(stream, &rollback) == AE_OK);
+  AE_CHECK(rollback.state == AE_STREAM_STATE_READY && rollback.run_generation == 0);
   state.fail_stop = true;
   AE_CHECK(ae_stream_start(stream, process, &processor) == AE_ERROR_QUIESCENCE_FAILURE);
   AE_CHECK(ae_stream_close(stream) == AE_ERROR_QUIESCENCE_FAILURE);
@@ -357,6 +367,7 @@ void failures() {
 void in_flight_stop() {
   state.owner = 0;
   state.threaded = true;
+  state.early_stop = true;
   auto *ctx = context();
   auto spec = request();
   ae_stream_format format{};
@@ -369,7 +380,11 @@ void in_flight_stop() {
   while (!processor.entered.load()) {
     processor.entered.wait(false);
   }
-  state.callbacks.sampleRateDidChange(96000);
+  state.callbacks.sampleRateDidChange(0);
+  ae_stream_status status{};
+  status.struct_size = sizeof(status);
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
+  AE_CHECK((status.fault_flags & AE_FAULT_CLOCK_LOST) != 0);
   state.stop_entered.store(false);
   std::atomic<bool> stopped{false};
   std::thread stopper([&] {

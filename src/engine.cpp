@@ -637,7 +637,10 @@ ae_result ae_stream_get_status(const ae_stream *stream, ae_stream_status *out_st
   status.fault_flags = stream->backend->faults();
   if (status.fault_flags != 0) {
     status.state = AE_STREAM_STATE_RECOVERY_REQUIRED;
-    status.last_result = AE_ERROR_DEVICE_UNAVAILABLE;
+    status.last_result = (status.fault_flags & AE_FAULT_DEVICE) != 0 ? AE_ERROR_DEVICE_UNAVAILABLE
+                         : (status.fault_flags & AE_FAULT_CALLBACK) != 0
+                             ? AE_ERROR_DRIVER_FAILURE
+                             : AE_ERROR_CONFIGURATION_CHANGED;
   }
   *out_status = status;
   return AE_OK;

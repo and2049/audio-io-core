@@ -303,7 +303,7 @@ public:
       overloads_.store(0);
       last_callback_.store(now());
       started_ = true;
-      gate_.store(true, std::memory_order_release);
+      gate_.store(true);
       ASIOError result;
       try {
         result = driver_->start();
@@ -339,7 +339,7 @@ public:
   }
 
   void buffer(long index, ASIOBool direct) noexcept {
-    if (!prepared_.load(std::memory_order_acquire)) {
+    if (!prepared_.load()) {
       return;
     }
     if (processing_.test_and_set(std::memory_order_acquire)) {
@@ -357,7 +357,7 @@ public:
       faults_.fetch_or(AE_FAULT_CALLBACK);
     }
     try {
-      if (gate_.load(std::memory_order_acquire) && faults() == 0) {
+      if (gate_.load() && faults() == 0) {
         for (size_t i = 0; i < inputs_.size(); ++i) {
           decode_samples(formats_[i], buffers_[i].buffers[index],
                          input_storage_.data() + i * frames_, frames_);
@@ -366,7 +366,7 @@ public:
         process_(state_, inputs_.data(), static_cast<uint32_t>(inputs_.size()), outputs_.data(),
                  static_cast<uint32_t>(outputs_.size()), frames_, frame_position_);
         frame_position_ += frames_;
-        if (!gate_.load(std::memory_order_acquire) || faults() != 0) {
+        if (!gate_.load() || faults() != 0) {
           std::fill(output_storage_.begin(), output_storage_.end(), 0.0f);
         }
         for (size_t i = 0; i < outputs_.size(); ++i) {
@@ -425,9 +425,9 @@ public:
       return 0;
     }
   }
-  void rate_changed() noexcept {
+  void rate_changed(ASIOSampleRate rate) noexcept {
     if (prepared_.load()) {
-      faults_.fetch_or(AE_FAULT_SAMPLE_RATE);
+      faults_.fetch_or(AE_FAULT_SAMPLE_RATE | (rate == 0 ? AE_FAULT_CLOCK_LOST : 0));
     }
   }
 
@@ -594,7 +594,7 @@ private:
 
   ae_result open_owned(const OpenRequest &request, ActualFormat &actual);
   ae_result stop_owned() {
-    gate_.store(false, std::memory_order_release);
+    gate_.store(false);
     if (started_) {
       ASIOError result;
       try {
@@ -623,7 +623,7 @@ private:
     if (stopped != AE_OK) {
       return stopped;
     }
-    prepared_.store(false, std::memory_order_release);
+    prepared_.store(false);
     const ae_result drained = drain();
     if (drained != AE_OK) {
       return drained;
@@ -733,10 +733,10 @@ ASIOTime *time_switch(ASIOTime *, long index, ASIOBool direct) {
   buffer_switch(index, direct);
   return nullptr;
 }
-void sample_rate_changed(ASIOSampleRate) {
+void sample_rate_changed(ASIOSampleRate rate) {
   RouteLease lease;
   if (lease.backend != nullptr) {
-    lease.backend->rate_changed();
+    lease.backend->rate_changed(rate);
   }
 }
 long asio_message(long selector, long value, void *, double *) {
@@ -838,7 +838,7 @@ ae_result AsioBackend::open_owned(const OpenRequest &request, ActualFormat &actu
   actual.max_frames_per_block = frames_;
   actual.input_channels = static_cast<uint32_t>(inputs_.size());
   actual.output_channels = static_cast<uint32_t>(outputs_.size());
-  prepared_.store(true, std::memory_order_release);
+  prepared_.store(true);
   return AE_OK;
 }
 
