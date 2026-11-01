@@ -57,6 +57,7 @@ struct State {
   ASIOSampleType created_type = ASIOSTInt32LSB;
   bool change_type_during_create = false, fail_final_channel_info = false;
   bool early_stop = false;
+  bool ramp_input = false;
   long minimum = 64, maximum = 256, preferred = 128, granularity = -1;
   std::atomic<bool> stop_entered{false};
   ASIOBool direct = ASIOTrue;
@@ -68,6 +69,12 @@ struct State {
 } state;
 
 void control_thread() { AE_CHECK(GetCurrentThreadId() == state.owner); }
+
+int32_t ramp_sample(long channel, long half, uint32_t frame) {
+  const int32_t magnitude = 0x10000000 + static_cast<int32_t>(half) * 0x01000000 +
+                            static_cast<int32_t>(frame) * 0x00010000;
+  return channel == 0 ? magnitude : -magnitude;
+}
 
 class Driver final : public IASIO {
 public:
@@ -188,6 +195,15 @@ public:
         auto &storage = state.storage[static_cast<size_t>(i * 2 + half)];
         storage.assign(static_cast<size_t>(frames), buffers[i].isInput ? 0x20000000 : 0x12345678);
         buffers[i].buffers[half] = state.null_buffer ? nullptr : storage.data();
+        if (state.ramp_input) {
+          storage.assign(static_cast<size_t>(frames) + 2, 0x12345678);
+          if (buffers[i].isInput) {
+            for (uint32_t frame = 0; frame < static_cast<uint32_t>(frames); ++frame) {
+              storage[frame + 1] = ramp_sample(buffers[i].channelNum, half, frame);
+            }
+          }
+          buffers[i].buffers[half] = storage.data() + 1;
+        }
       }
     }
     state.buffers.assign(buffers, buffers + channels);
@@ -550,6 +566,91 @@ void allocation_cleanup() {
   AE_CHECK(ae_stream_close(stream) == AE_OK);
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
 }
+
+struct RoutingProcessor {
+  uint32_t calls = 0;
+  uint32_t half = 0;
+  uint64_t position = 0;
+  ae_process_result result = AE_PROCESS_OK;
+  bool partial = false;
+};
+
+ae_process_result route_ramps(void *user, const ae_audio_block *block) {
+  auto &processor = *static_cast<RoutingProcessor *>(user);
+  AE_CHECK(block->input_channels == 2 && block->output_channels == 2 && block->frames == 128);
+  AE_CHECK(block->frame_position == processor.position);
+  processor.position += block->frames;
+  ++processor.calls;
+  for (uint32_t frame = 0; frame < block->frames; ++frame) {
+    const float magnitude =
+        0.125f + static_cast<float>(processor.half) / 128.0f + static_cast<float>(frame) / 32768.0f;
+    AE_CHECK(block->inputs[0][frame] == -magnitude);
+    AE_CHECK(block->inputs[1][frame] == magnitude);
+    AE_CHECK(block->outputs[0][frame] == 0.0f && block->outputs[1][frame] == 0.0f);
+    if (!processor.partial || frame + 1 < block->frames) {
+      block->outputs[0][frame] = block->inputs[1][frame];
+      block->outputs[1][frame] = block->inputs[0][frame];
+    }
+  }
+  return processor.result;
+}
+
+void channel_routing() {
+  state.owner = 0;
+  state.ramp_input = true;
+  auto *ctx = context();
+  auto spec = request();
+  const uint32_t inputs[] = {1, 0};
+  spec.input_channels = {AE_CHANNEL_MODE_EXPLICIT, 2, inputs};
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  for (ae_direction direction : {AE_DIRECTION_INPUT, AE_DIRECTION_OUTPUT}) {
+    for (uint32_t channel = 0; channel < 2; ++channel) {
+      uint32_t physical = 0;
+      AE_CHECK(ae_stream_get_channel(stream, direction, channel, &physical) == AE_OK);
+      AE_CHECK(physical == 1 - channel);
+    }
+  }
+  RoutingProcessor processor;
+  for (uint32_t cycle = 0; cycle < 2; ++cycle) {
+    processor.position = 0;
+    processor.half = 0;
+    processor.partial = false;
+    processor.result = AE_PROCESS_OK;
+    AE_CHECK(ae_stream_start(stream, route_ramps, &processor) == AE_OK);
+    for (uint32_t block = 0; block < 6; ++block) {
+      processor.half = block % 2;
+      processor.partial = block == 2;
+      processor.result = block == 3   ? AE_PROCESS_SILENCE
+                         : block == 4 ? AE_PROCESS_FAILED
+                                      : AE_PROCESS_OK;
+      const uint32_t previous_calls = processor.calls;
+      if (block != 0) {
+        state.callbacks.bufferSwitch(processor.half, ASIOTrue);
+        AE_CHECK(processor.calls == previous_calls + (block < 5 ? 1 : 0));
+      }
+      for (size_t buffer = 0; buffer < state.buffers.size(); ++buffer) {
+        const auto &native = state.buffers[buffer];
+        const auto &storage = state.storage[buffer * 2 + processor.half];
+        AE_CHECK(storage.front() == 0x12345678 && storage.back() == 0x12345678);
+        for (uint32_t frame = 0; frame < 128; ++frame) {
+          const int32_t expected = native.isInput
+                                       ? ramp_sample(native.channelNum, processor.half, frame)
+                                   : block >= 3 || (processor.partial && frame == 127)
+                                       ? 0
+                                       : ramp_sample(1 - native.channelNum, processor.half, frame);
+          AE_CHECK(storage[frame + 1] == expected);
+        }
+      }
+    }
+    AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  }
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+  state.ramp_input = false;
+}
 }
 
 int main() {
@@ -559,5 +660,6 @@ int main() {
   preparation_changes();
   watchdog_timing();
   allocation_cleanup();
+  channel_routing();
   in_flight_stop();
 }

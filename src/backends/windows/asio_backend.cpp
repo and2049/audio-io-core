@@ -364,7 +364,6 @@ public:
           decode_samples(formats_[i], buffers_[i].buffers[index],
                          input_storage_.data() + i * frames_, frames_);
         }
-        std::fill(output_storage_.begin(), output_storage_.end(), 0.0f);
         process_(state_, inputs_.data(), static_cast<uint32_t>(inputs_.size()), outputs_.data(),
                  static_cast<uint32_t>(outputs_.size()), frames_, frame_position_);
         frame_position_ += frames_;
