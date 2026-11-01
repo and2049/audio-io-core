@@ -49,6 +49,11 @@ struct State {
   bool fail_init = false, fail_create = false, fail_start = false, fail_stop = false;
   bool fail_dispose = false, threaded = false, null_buffer = false;
   bool change_rate_during_create = false, change_map_during_create = false;
+  bool notify_set_rate = false, notify_create_rate = false, notify_query_rate = false;
+  bool notify_latency_rate = false;
+  double notified_rate = 96000;
+  ASIOSampleType created_type = ASIOSTInt32LSB;
+  bool change_type_during_create = false, fail_final_channel_info = false;
   bool early_stop = false;
   long minimum = 64, maximum = 256, preferred = 128, granularity = -1;
   std::atomic<bool> stop_entered{false};
@@ -118,6 +123,10 @@ public:
     control_thread();
     *input = 32;
     *output = 64;
+    if (state.notify_latency_rate) {
+      rate_ = state.notified_rate;
+      state.callbacks.sampleRateDidChange(rate_);
+    }
     return ASE_OK;
   }
   ASIOError getBufferSize(long *min, long *max, long *preferred, long *granularity) override {
@@ -135,11 +144,18 @@ public:
   ASIOError getSampleRate(ASIOSampleRate *rate) override {
     control_thread();
     *rate = rate_;
+    if (created_ && state.notify_query_rate) {
+      rate_ = state.notified_rate;
+      state.callbacks.sampleRateDidChange(rate_);
+    }
     return ASE_OK;
   }
   ASIOError setSampleRate(ASIOSampleRate rate) override {
     control_thread();
     rate_ = rate;
+    if (state.notify_set_rate) {
+      state.callbacks.sampleRateDidChange(rate_);
+    }
     return ASE_OK;
   }
   ASIOError getClockSources(ASIOClockSource *, long *) override { return ASE_NotPresent; }
@@ -147,7 +163,10 @@ public:
   ASIOError getSamplePosition(ASIOSamples *, ASIOTimeStamp *) override { return ASE_NotPresent; }
   ASIOError getChannelInfo(ASIOChannelInfo *info) override {
     control_thread();
-    info->type = state.type;
+    if (created_ && state.fail_final_channel_info) {
+      return ASE_HWMalfunction;
+    }
+    info->type = created_ && state.change_type_during_create ? state.created_type : state.type;
     std::memcpy(info->name, "Fake channel", sizeof("Fake channel"));
     return ASE_OK;
   }
@@ -155,6 +174,7 @@ public:
                           ASIOCallbacks *callbacks) override {
     control_thread();
     state.callbacks = *callbacks;
+    created_ = true;
     AE_CHECK(callbacks->asioMessage(kAsioEngineVersion, 0, nullptr, nullptr) == 2);
     callbacks->bufferSwitch(0, ASIOTrue);
     state.storage.resize(static_cast<size_t>(channels) * 2);
@@ -172,6 +192,9 @@ public:
     if (state.change_map_during_create) {
       buffers[0].channelNum = 0;
     }
+    if (state.notify_create_rate) {
+      callbacks->sampleRateDidChange(state.notified_rate);
+    }
     return state.fail_create ? ASE_NoMemory : ASE_OK;
   }
   ASIOError disposeBuffers() override {
@@ -187,6 +210,7 @@ public:
   }
 
 private:
+  bool created_ = false;
   double rate_ = 48000;
   std::thread thread_;
 };
@@ -403,11 +427,57 @@ void in_flight_stop() {
   AE_CHECK(ae_stream_close(stream) == AE_OK);
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
 }
+
+void preparation_changes() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  for (bool *notification :
+       {&state.notify_create_rate, &state.notify_query_rate, &state.notify_latency_rate}) {
+    for (double rate : {0.0, 48000.0, 96000.0}) {
+      state.notified_rate = rate;
+      *notification = true;
+      AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_CONFIGURATION_CHANGED);
+      AE_CHECK(stream == nullptr);
+      *notification = false;
+    }
+  }
+  state.notify_set_rate = true;
+  spec.sample_rate = 44100;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  AE_CHECK(format.sample_rate == 44100);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  state.notify_set_rate = false;
+  spec.sample_rate = 48000;
+  state.change_type_during_create = true;
+  for (ASIOSampleType type :
+       {ASIOSTFloat32LSB, ASIOSTInt16LSB, ASIOSTInt32MSB, ASIOSTDSDInt8LSB1}) {
+    state.created_type = type;
+    AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_CONFIGURATION_CHANGED);
+    AE_CHECK(stream == nullptr);
+    AE_CHECK(state.storage[2][0] == 0x12345678);
+  }
+  state.change_type_during_create = false;
+  state.fail_final_channel_info = true;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
+  state.fail_final_channel_info = false;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  state.callbacks.sampleRateDidChange(96000);
+  Processor processor;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_ERROR_INVALID_STATE);
+  AE_CHECK(processor.calls == 0);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
 }
 
 int main() {
   static_assert(sizeof(long) == 4 && sizeof(ASIOSamples) == 8 && sizeof(ASIOBufferInfo) == 24);
   lifecycle();
   failures();
+  preparation_changes();
   in_flight_stop();
 }

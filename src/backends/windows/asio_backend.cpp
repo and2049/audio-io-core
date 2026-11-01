@@ -426,9 +426,7 @@ public:
     }
   }
   void rate_changed(ASIOSampleRate rate) noexcept {
-    if (prepared_.load()) {
-      faults_.fetch_or(AE_FAULT_SAMPLE_RATE | (rate == 0 ? AE_FAULT_CLOCK_LOST : 0));
-    }
+    faults_.fetch_or(AE_FAULT_SAMPLE_RATE | (rate == 0 ? AE_FAULT_CLOCK_LOST : 0));
   }
 
 private:
@@ -766,10 +764,11 @@ ae_result AsioBackend::open_owned(const OpenRequest &request, ActualFormat &actu
     if (changed != ASE_OK) {
       return fail("setSampleRate", changed);
     }
-    result = capabilities(caps);
-    if (result != AE_OK) {
-      return result;
-    }
+  }
+  faults_.fetch_and(~uint32_t{AE_FAULT_SAMPLE_RATE});
+  result = capabilities(caps);
+  if (result != AE_OK) {
+    return result;
   }
   if (!request.allow_adjustment && caps.info.current_sample_rate != rate) {
     return AE_ERROR_UNSUPPORTED_CONFIGURATION;
@@ -825,13 +824,25 @@ ae_result AsioBackend::open_owned(const OpenRequest &request, ActualFormat &actu
         buffers_[i].isInput != (input ? ASIOTrue : ASIOFalse)) {
       return fail("channel mapping changed during buffer creation", 0);
     }
+    ASIOChannelInfo channel{};
+    channel.channel = static_cast<long>(expected);
+    channel.isInput = input ? ASIOTrue : ASIOFalse;
+    const ASIOError channel_result = driver_->getChannelInfo(&channel);
+    if (channel_result != ASE_OK) {
+      return fail("getChannelInfo after buffer creation", channel_result);
+    }
+    const auto &previous = input ? caps.inputs[expected] : caps.outputs[expected];
+    if (channel.type != previous.native_format) {
+      return fail("sample format changed during buffer creation", channel.type,
+                  AE_ERROR_CONFIGURATION_CHANGED);
+    }
   }
   clear_outputs(0);
   clear_outputs(1);
   output_ready_ = driver_->outputReady() == ASE_OK;
   read_latencies();
   if (faults() != 0) {
-    return fail("configuration invalidated", faults(), AE_ERROR_DEVICE_UNAVAILABLE);
+    return fail("configuration invalidated", faults(), AE_ERROR_CONFIGURATION_CHANGED);
   }
   actual.sample_rate = rate_;
   actual.frames_per_block = frames_;
