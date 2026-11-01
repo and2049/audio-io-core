@@ -49,6 +49,7 @@ struct State {
   uint32_t activations = 0, releases = 0, disposals = 0;
   bool fail_init = false, fail_create = false, fail_start = false, fail_stop = false;
   bool fail_dispose = false, threaded = false, null_buffer = false;
+  bool fail_create_empty = false, invalid_dispose = false;
   bool change_rate_during_create = false, change_map_during_create = false;
   bool notify_set_rate = false, notify_create_rate = false, notify_query_rate = false;
   bool notify_latency_rate = false;
@@ -175,6 +176,9 @@ public:
                           ASIOCallbacks *callbacks) override {
     control_thread();
     state.callbacks = *callbacks;
+    if (state.fail_create_empty) {
+      return ASE_NoMemory;
+    }
     created_ = true;
     AE_CHECK(callbacks->asioMessage(kAsioEngineVersion, 0, nullptr, nullptr) == 2);
     callbacks->bufferSwitch(0, ASIOTrue);
@@ -201,7 +205,14 @@ public:
   ASIOError disposeBuffers() override {
     control_thread();
     ++state.disposals;
-    return state.fail_dispose ? ASE_HWMalfunction : ASE_OK;
+    if (state.fail_dispose) {
+      return ASE_HWMalfunction;
+    }
+    if (!created_ || state.invalid_dispose) {
+      return ASE_InvalidMode;
+    }
+    created_ = false;
+    return ASE_OK;
   }
   ASIOError controlPanel() override { return ASE_NotPresent; }
   ASIOError future(long, void *) override { return ASE_NotPresent; }
@@ -499,6 +510,46 @@ void watchdog_timing() {
   AE_CHECK(!ae::detail::asio_callback_stalled(last, long_timeout, [&] { return period; }));
   AE_CHECK(ae::detail::asio_callback_stalled(last, long_timeout, [&] { return long_timeout + 1; }));
 }
+
+void allocation_cleanup() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  const uint32_t releases = state.releases;
+  state.fail_create_empty = true;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
+  AE_CHECK(stream == nullptr && state.releases == releases + 1);
+  ae_diagnostic diagnostic{};
+  diagnostic.struct_size = sizeof(diagnostic);
+  AE_CHECK(ae_context_get_diagnostic(ctx, &diagnostic) == AE_OK);
+  AE_CHECK(diagnostic.native_code == ASE_NoMemory);
+  state.fail_dispose = true;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
+  AE_CHECK(ae_context_destroy(ctx) == AE_ERROR_DRIVER_FAILURE);
+  state.fail_dispose = false;
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+  state.fail_create_empty = false;
+  state.owner = 0;
+  ctx = context();
+  state.fail_create = true;
+  state.invalid_dispose = true;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_ERROR_DRIVER_FAILURE);
+  AE_CHECK(ae_context_destroy(ctx) == AE_ERROR_DRIVER_FAILURE);
+  state.fail_create = false;
+  state.invalid_dispose = false;
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+  state.owner = 0;
+  ctx = context();
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  state.invalid_dispose = true;
+  AE_CHECK(ae_stream_close(stream) == AE_ERROR_DRIVER_FAILURE);
+  state.invalid_dispose = false;
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
 }
 
 int main() {
@@ -507,5 +558,6 @@ int main() {
   failures();
   preparation_changes();
   watchdog_timing();
+  allocation_cleanup();
   in_flight_stop();
 }

@@ -628,11 +628,17 @@ private:
     if (drained != AE_OK) {
       return drained;
     }
-    if (buffers_created_) {
+    if (buffers_attempted_) {
+      const bool empty_failure =
+          !buffers_created_ &&
+          std::all_of(buffers_.begin(), buffers_.end(), [](const ASIOBufferInfo &buffer) {
+            return buffer.buffers[0] == nullptr && buffer.buffers[1] == nullptr;
+          });
       const ASIOError result = driver_->disposeBuffers();
-      if (result != ASE_OK) {
+      if (result != ASE_OK && !(empty_failure && result == ASE_InvalidMode)) {
         return fail("disposeBuffers", result);
       }
+      buffers_attempted_ = false;
       buffers_created_ = false;
     }
     route.store(nullptr);
@@ -693,6 +699,7 @@ private:
   IASIO *driver_ = nullptr;
   bool owned_ = false;
   bool started_ = false;
+  bool buffers_attempted_ = false;
   bool buffers_created_ = false;
   bool output_ready_ = false;
   ASIOCallbacks callbacks_{};
@@ -805,12 +812,13 @@ ae_result AsioBackend::open_owned(const OpenRequest &request, ActualFormat &actu
     outputs_[i] = output_storage_.data() + i * frames_;
   }
   callbacks_ = {buffer_switch, sample_rate_changed, asio_message, time_switch};
-  buffers_created_ = true;
+  buffers_attempted_ = true;
   const ASIOError created = driver_->createBuffers(
       buffers_.data(), static_cast<long>(buffers_.size()), static_cast<long>(frames_), &callbacks_);
   if (created != ASE_OK) {
     return fail("createBuffers", created);
   }
+  buffers_created_ = true;
   for (const auto &buffer : buffers_) {
     if (buffer.buffers[0] == nullptr || buffer.buffers[1] == nullptr) {
       return fail("buffer pointers", 0);
