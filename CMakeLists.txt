@@ -16,6 +16,7 @@ else()
 endif()
 
 option(AUDIO_ENGINE_BUILD_TESTS "Build the audio_engine tests" ${AUDIO_ENGINE_TESTS_DEFAULT})
+option(AUDIO_ENGINE_BUILD_EXAMPLES "Build the audio_engine examples" ${PROJECT_IS_TOP_LEVEL})
 
 function(audio_engine_set_warnings target)
   if(MSVC)
@@ -35,6 +36,10 @@ audio_engine_set_warnings(audio_engine)
 if(AUDIO_ENGINE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(unittests)
+endif()
+
+if(AUDIO_ENGINE_BUILD_EXAMPLES)
+  add_subdirectory(examples)
 endif()
 
 include(tools/DeveloperTools.cmake)
