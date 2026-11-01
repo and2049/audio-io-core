@@ -7,6 +7,7 @@
 
 #include "Check.h"
 #include "backends/windows/asio_backend.h"
+#include "backends/windows/asio_timing.h"
 #include "testing_api.h"
 
 thread_local bool forbid_allocation = false;
@@ -472,6 +473,32 @@ void preparation_changes() {
   AE_CHECK(ae_stream_close(stream) == AE_OK);
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
 }
+
+void watchdog_timing() {
+  const uint64_t frequency = 10000000;
+  const uint64_t timeout = ae::detail::asio_stall_timeout(frequency, 128, 48000);
+  AE_CHECK(timeout == frequency * 2);
+  std::atomic<uint64_t> last{frequency};
+  AE_CHECK(!ae::detail::asio_callback_stalled(last, timeout, [&] { return frequency - 1; }));
+  AE_CHECK(!ae::detail::asio_callback_stalled(last, timeout, [&] { return frequency + timeout; }));
+  AE_CHECK(
+      ae::detail::asio_callback_stalled(last, timeout, [&] { return frequency + timeout + 1; }));
+  AE_CHECK(!ae::detail::asio_callback_stalled(last, timeout, [&] {
+    last.store(frequency + 2);
+    return frequency + 1;
+  }));
+  AE_CHECK(!ae::detail::asio_callback_stalled(last, timeout, [&] {
+    const auto current = frequency + timeout + 10;
+    last.store(current);
+    return current;
+  }));
+  const uint64_t period = frequency * 65536 / 8000;
+  const uint64_t long_timeout = ae::detail::asio_stall_timeout(frequency, 65536, 8000);
+  AE_CHECK(long_timeout == period * 3);
+  last.store(0);
+  AE_CHECK(!ae::detail::asio_callback_stalled(last, long_timeout, [&] { return period; }));
+  AE_CHECK(ae::detail::asio_callback_stalled(last, long_timeout, [&] { return long_timeout + 1; }));
+}
 }
 
 int main() {
@@ -479,5 +506,6 @@ int main() {
   lifecycle();
   failures();
   preparation_changes();
+  watchdog_timing();
   in_flight_stop();
 }

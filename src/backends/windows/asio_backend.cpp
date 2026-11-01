@@ -1,5 +1,7 @@
 #include "asio_backend.h"
 
+#include "asio_timing.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -674,7 +676,10 @@ private:
       if (prepared_.load() && latency_dirty_.exchange(false)) {
         read_latencies();
       }
-      if (started_ && gate_.load() && now() - last_callback_.load() > frequency_ * 2) {
+      if (started_ && gate_.load() &&
+          detail::asio_callback_stalled(last_callback_,
+                                        detail::asio_stall_timeout(frequency_, frames_, rate_),
+                                        [this] { return now(); })) {
         faults_.fetch_or(AE_FAULT_DEVICE);
       }
     } catch (...) {
