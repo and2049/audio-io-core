@@ -1,5 +1,16 @@
 find_package(Threads REQUIRED)
 
+if(AUDIO_ENGINE_ENABLE_ASIO)
+  add_executable(AudioEngineAsioTest Windows/AsioTest.cpp)
+  target_link_libraries(AudioEngineAsioTest PRIVATE AudioEngineTestBackend)
+  target_include_directories(AudioEngineAsioTest SYSTEM PRIVATE "${AUDIO_ENGINE_ASIO_SDK}/common")
+  target_compile_definitions(AudioEngineAsioTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_features(AudioEngineAsioTest PRIVATE cxx_std_20)
+  audio_engine_set_warnings(AudioEngineAsioTest)
+  add_test(NAME AudioEngine.ASIO COMMAND AudioEngineAsioTest)
+  set_tests_properties(AudioEngine.ASIO PROPERTIES TIMEOUT 30)
+endif()
+
 add_executable(AudioEngineConversionTest ConversionTest.cpp)
 target_link_libraries(AudioEngineConversionTest PRIVATE AudioEngineTestBackend)
 target_compile_features(AudioEngineConversionTest PRIVATE cxx_std_20)

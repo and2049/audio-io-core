@@ -40,7 +40,10 @@ int main(void) {
 
   ae_device_snapshot *snapshot = NULL;
   CHECK(ae_context_enumerate_devices(context, &snapshot) == AE_OK);
-  CHECK(ae_device_snapshot_count(snapshot) == 0);
+  ae_device_info info = {0};
+  info.struct_size = sizeof(info);
+  CHECK(ae_device_snapshot_get(snapshot, ae_device_snapshot_count(snapshot), &info) ==
+        AE_ERROR_INVALID_ARGUMENT);
   CHECK(ae_device_snapshot_release(snapshot) == AE_OK);
 
   static const uint32_t channel = 0;

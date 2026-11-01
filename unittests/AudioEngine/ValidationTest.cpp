@@ -68,7 +68,7 @@ void testApiVersion() {
   AE_CHECK(ae_get_api_version(&major, nullptr) == AE_ERROR_INVALID_ARGUMENT);
 }
 
-void testProductionContextHasEmptyCatalog() {
+void testProductionCatalog() {
   ae_context_options options = currentOptions();
   ae_context *context = nullptr;
   AE_CHECK(ae_context_create(&options, &context) == AE_OK);
@@ -77,11 +77,11 @@ void testProductionContextHasEmptyCatalog() {
   ae_device_snapshot *snapshot = nullptr;
   AE_CHECK(ae_context_enumerate_devices(context, &snapshot) == AE_OK);
   AE_CHECK(snapshot != nullptr);
-  AE_CHECK(ae_device_snapshot_count(snapshot) == 0);
+  const uint32_t count = ae_device_snapshot_count(snapshot);
 
   ae_device_info info{};
   info.struct_size = static_cast<uint32_t>(sizeof(ae_device_info));
-  AE_CHECK(ae_device_snapshot_get(snapshot, 0, &info) == AE_ERROR_INVALID_ARGUMENT);
+  AE_CHECK(ae_device_snapshot_get(snapshot, count, &info) == AE_ERROR_INVALID_ARGUMENT);
   AE_CHECK(ae_device_snapshot_release(snapshot) == AE_OK);
   AE_CHECK(ae_context_destroy(context) == AE_OK);
 
@@ -359,7 +359,7 @@ void testNullSnapshotArguments() {
 
 int main() {
   testApiVersion();
-  testProductionContextHasEmptyCatalog();
+  testProductionCatalog();
   testIncompatibleAbi();
   testRequestValidation();
   testNegotiation();

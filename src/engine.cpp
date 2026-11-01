@@ -11,6 +11,10 @@
 #include "backend.h"
 #include "testing_api.h"
 
+#ifdef AUDIO_ENGINE_HAS_ASIO
+#include "backends/windows/asio_backend.h"
+#endif
+
 struct ae_device_snapshot {
   ae_context *context = nullptr;
   std::vector<std::string> strings;
@@ -370,7 +374,16 @@ ae_result ae_context_create(const ae_context_options *options, ae_context **out_
         options->api_version_minor != AE_API_VERSION_MINOR) {
       return AE_ERROR_INCOMPATIBLE_ABI;
     }
+#ifdef AUDIO_ENGINE_HAS_ASIO
+    auto backend = ae::make_asio_backend();
+    const ae_result result = backend->refresh();
+    if (result != AE_OK) {
+      return result;
+    }
+    return ae::detail::create_context_with_backend(std::move(backend), out_context);
+#else
     return ae::detail::create_context_with_backend(std::make_unique<EmptyBackend>(), out_context);
+#endif
   });
 }
 
