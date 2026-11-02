@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -66,9 +67,35 @@ struct State {
   std::vector<ASIOBufferInfo> buffers;
   std::vector<std::vector<int32_t>> storage;
   std::atomic<uint32_t> output_ready{0};
+  std::atomic<ASIOError> output_ready_result{ASE_OK}, latency_result{ASE_OK};
+  std::atomic<long> input_latency{32}, output_latency{64};
+  std::atomic<uint32_t> latency_queries{0}, latency_permits{UINT32_MAX};
+  std::atomic<uint32_t> notify_latency_query{0};
+  long ready_half = -1;
+  int32_t ready_left = 0, ready_right = 0;
 } state;
 
 void control_thread() { AE_CHECK(GetCurrentThreadId() == state.owner); }
+
+template <typename Predicate> void wait_until(Predicate predicate) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!predicate()) {
+    AE_CHECK(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+}
+
+ae_stream_status status_of(ae_stream *stream) {
+  ae_stream_status status{};
+  status.struct_size = sizeof(status);
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK);
+  return status;
+}
+
+void permit_latency(uint32_t query) {
+  state.latency_permits.store(query);
+  state.latency_permits.notify_all();
+}
 
 int32_t ramp_sample(long channel, long half, uint32_t frame) {
   const int32_t magnitude = 0x10000000 + static_cast<int32_t>(half) * 0x01000000 +
@@ -130,13 +157,22 @@ public:
   }
   ASIOError getLatencies(long *input, long *output) override {
     control_thread();
-    *input = 32;
-    *output = 64;
+    *input = state.input_latency.load();
+    *output = state.output_latency.load();
+    const ASIOError result = state.latency_result.load();
+    const uint32_t query = state.latency_queries.fetch_add(1) + 1;
+    for (auto permit = state.latency_permits.load(); permit < query;
+         permit = state.latency_permits.load()) {
+      state.latency_permits.wait(permit);
+    }
+    if (query == state.notify_latency_query.load()) {
+      AE_CHECK(state.callbacks.asioMessage(kAsioLatenciesChanged, 0, nullptr, nullptr) == 1);
+    }
     if (state.notify_latency_rate) {
       rate_ = state.notified_rate;
       state.callbacks.sampleRateDidChange(rate_);
     }
-    return ASE_OK;
+    return result;
   }
   ASIOError getBufferSize(long *min, long *max, long *preferred, long *granularity) override {
     control_thread();
@@ -233,8 +269,14 @@ public:
   ASIOError controlPanel() override { return ASE_NotPresent; }
   ASIOError future(long, void *) override { return ASE_NotPresent; }
   ASIOError outputReady() override {
+    if (state.ready_half >= 0) {
+      for (uint32_t frame = 0; frame < 128; ++frame) {
+        AE_CHECK(state.storage[2 + state.ready_half][frame] == state.ready_left);
+        AE_CHECK(state.storage[4 + state.ready_half][frame] == state.ready_right);
+      }
+    }
     ++state.output_ready;
-    return ASE_OK;
+    return state.output_ready_result.load();
   }
 
 private:
@@ -727,6 +769,220 @@ void unsupported_buffer_resize() {
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
 }
 
+void latency_notifications() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  Processor processor;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  AE_CHECK(status_of(stream).latency_valid == 1);
+  AE_CHECK(state.callbacks.asioMessage(kAsioSelectorSupported, kAsioLatenciesChanged, nullptr,
+                                       nullptr) == 1);
+  const uint32_t first = state.latency_queries.load() + 1;
+  permit_latency(first - 1);
+  state.input_latency.store(48);
+  state.output_latency.store(96);
+  state.notify_latency_query.store(first);
+  AE_CHECK(state.callbacks.asioMessage(kAsioLatenciesChanged, 0, nullptr, nullptr) == 1);
+  wait_until([&] { return state.latency_queries.load() == first; });
+  AE_CHECK(status_of(stream).latency_valid == 0);
+  state.callbacks.bufferSwitch(1, ASIOTrue);
+  AE_CHECK(processor.calls == 2 && status_of(stream).fault_flags == 0);
+  state.input_latency.store(64);
+  state.output_latency.store(128);
+  permit_latency(first);
+  wait_until([&] { return state.latency_queries.load() == first + 1; });
+  AE_CHECK(status_of(stream).latency_valid == 0);
+  permit_latency(first + 1);
+  wait_until([&] {
+    const auto status = status_of(stream);
+    return status.latency_valid == 1 && status.input_latency_frames == 64 &&
+           status.output_latency_frames == 128;
+  });
+  for (uint32_t failure = 0; failure < 3; ++failure) {
+    const uint32_t query = state.latency_queries.load() + 1;
+    state.latency_result.store(failure == 0 ? ASE_HWMalfunction : ASE_OK);
+    state.input_latency.store(failure == 1 ? -1 : 0);
+    state.output_latency.store(failure == 2 ? -1 : 0);
+    AE_CHECK(state.callbacks.asioMessage(kAsioLatenciesChanged, 0, nullptr, nullptr) == 1);
+    wait_until([&] { return state.latency_queries.load() == query; });
+    permit_latency(query);
+    AE_CHECK(ae_stream_stop(stream) == AE_OK);
+    AE_CHECK(status_of(stream).latency_valid == 0 && status_of(stream).fault_flags == 0);
+    AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  }
+  state.latency_result.store(ASE_OK);
+  state.input_latency.store(0);
+  state.output_latency.store(0);
+  permit_latency(UINT32_MAX);
+  AE_CHECK(state.callbacks.asioMessage(kAsioLatenciesChanged, 0, nullptr, nullptr) == 1);
+  wait_until([&] {
+    const auto status = status_of(stream);
+    return status.latency_valid == 1 && status.input_latency_frames == 0 &&
+           status.output_latency_frames == 0;
+  });
+  AE_CHECK(status_of(stream).state == AE_STREAM_STATE_RUNNING);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+  state.input_latency.store(32);
+  state.output_latency.store(64);
+  state.notify_latency_query.store(0);
+}
+
+void resync_and_overload() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  Processor processor;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  for (long selector : {kAsioOverload, kAsioResyncRequest}) {
+    AE_CHECK(state.callbacks.asioMessage(kAsioSelectorSupported, selector, nullptr, nullptr) == 1);
+  }
+  for (uint32_t count = 1; count <= 3; ++count) {
+    AE_CHECK(state.callbacks.asioMessage(kAsioOverload, 0, nullptr, nullptr) == 1);
+    const auto status = status_of(stream);
+    AE_CHECK(status.driver_overloads == count && status.fault_flags == 0);
+    AE_CHECK(status.state == AE_STREAM_STATE_RUNNING && status.run_generation == 1);
+  }
+  state.callbacks.bufferSwitch(1, ASIOTrue);
+  AE_CHECK(processor.calls == 2);
+  AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  AE_CHECK(status_of(stream).driver_overloads == 0);
+  AE_CHECK(state.callbacks.asioMessage(kAsioResyncRequest, 0, nullptr, nullptr) == 1);
+  const auto faulted = status_of(stream);
+  AE_CHECK(faulted.fault_flags == AE_FAULT_RESYNC);
+  AE_CHECK(faulted.state == AE_STREAM_STATE_RECOVERY_REQUIRED);
+  AE_CHECK(faulted.last_result == AE_ERROR_CONFIGURATION_CHANGED);
+  const uint32_t calls = processor.calls.load();
+  state.callbacks.bufferSwitch(1, ASIOTrue);
+  AE_CHECK(processor.calls == calls && state.storage[3][0] == 0 && state.storage[5][0] == 0);
+  AE_CHECK(ae_stream_stop(stream) == AE_OK);
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_ERROR_INVALID_STATE);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  AE_CHECK(status_of(stream).fault_flags == 0);
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
+
+void output_ready_modes() {
+  for (ASIOError support : {ASE_NotPresent, ASE_OK}) {
+    state.owner = 0;
+    state.output_ready.store(0);
+    state.output_ready_result.store(support);
+    auto *ctx = context();
+    auto spec = request();
+    ae_stream_format format{};
+    format.struct_size = sizeof(format);
+    ae_stream *stream = nullptr;
+    AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+    AE_CHECK(state.output_ready == 1);
+    state.ready_half = 0;
+    state.ready_left = 0x40000000;
+    state.ready_right = -0x40000000;
+    Processor processor;
+    AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+    AE_CHECK(state.output_ready == (support == ASE_OK ? 2u : 1u));
+    state.output_ready_result.store(ASE_HWMalfunction);
+    state.ready_half = 1;
+    state.callbacks.bufferSwitch(1, ASIOTrue);
+    AE_CHECK(processor.calls == 2);
+    AE_CHECK(status_of(stream).fault_flags == (support == ASE_OK ? AE_FAULT_DEVICE : 0u));
+    if (support == ASE_OK) {
+      state.output_ready_result.store(ASE_OK);
+      state.ready_half = 0;
+      state.ready_left = state.ready_right = 0;
+      state.callbacks.bufferSwitch(0, ASIOTrue);
+      AE_CHECK(processor.calls == 2 && state.output_ready == 4);
+      AE_CHECK(status_of(stream).state == AE_STREAM_STATE_RECOVERY_REQUIRED);
+    } else {
+      AE_CHECK(state.output_ready == 1 && status_of(stream).state == AE_STREAM_STATE_RUNNING);
+    }
+    AE_CHECK(ae_stream_close(stream) == AE_OK);
+    AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+    state.ready_half = -1;
+  }
+  state.output_ready_result.store(ASE_OK);
+}
+
+void callback_entry_variants() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  Processor processor;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  ASIOTime time{};
+  const auto original = time;
+  AE_CHECK(state.callbacks.bufferSwitchTimeInfo(&time, 1, ASIOTrue) == nullptr);
+  AE_CHECK(std::memcmp(&time, &original, sizeof(time)) == 0);
+  AE_CHECK(state.callbacks.bufferSwitchTimeInfo(nullptr, 0, ASIOTrue) == nullptr);
+  AE_CHECK(processor.calls == 3 && status_of(stream).delivered_frames == 384);
+  AE_CHECK(state.storage[3][0] == 0x40000000 && state.storage[5][0] == -0x40000000);
+  AE_CHECK(state.callbacks.bufferSwitchTimeInfo(&time, 1, ASIOFalse) == nullptr);
+  AE_CHECK(processor.calls == 3 && status_of(stream).fault_flags == AE_FAULT_CALLBACK);
+  AE_CHECK(state.storage[3][0] == 0 && state.storage[5][0] == 0);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  for (long index : {-1L, 2L}) {
+    AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+    AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+    const auto storage = state.storage;
+    const uint32_t calls = processor.calls.load();
+    const uint32_t ready = state.output_ready.load();
+    state.callbacks.bufferSwitch(index, ASIOTrue);
+    AE_CHECK(processor.calls == calls && state.output_ready == ready);
+    AE_CHECK(state.storage == storage && status_of(stream).fault_flags == AE_FAULT_CALLBACK);
+    state.callbacks.bufferSwitch(1, ASIOTrue);
+    AE_CHECK(processor.calls == calls && state.storage[3][0] == 0 && state.storage[5][0] == 0);
+    AE_CHECK(ae_stream_close(stream) == AE_OK);
+  }
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
+
+void overlapping_callbacks() {
+  for (long half : {0L, 1L}) {
+    state.owner = 0;
+    state.threaded = true;
+    state.early_stop = false;
+    auto *ctx = context();
+    auto spec = request();
+    ae_stream_format format{};
+    format.struct_size = sizeof(format);
+    ae_stream *stream = nullptr;
+    AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+    Processor processor;
+    processor.release.store(false);
+    AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+    wait_until([&] { return processor.entered.load(); });
+    const auto ready = state.output_ready.load();
+    AE_CHECK(state.callbacks.bufferSwitchTimeInfo(nullptr, half, ASIOTrue) == nullptr);
+    AE_CHECK(processor.calls == 1 && state.output_ready == ready);
+    AE_CHECK(status_of(stream).fault_flags == AE_FAULT_CALLBACK);
+    processor.release.store(true);
+    processor.release.notify_all();
+    AE_CHECK(ae_stream_stop(stream) == AE_OK);
+    AE_CHECK(state.storage[2][0] == 0 && state.storage[4][0] == 0);
+    AE_CHECK(processor.calls == 1 && state.output_ready == ready + 1);
+    AE_CHECK(ae_stream_start(stream, process, &processor) == AE_ERROR_INVALID_STATE);
+    AE_CHECK(ae_stream_close(stream) == AE_OK);
+    AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+  }
+  state.threaded = false;
+}
+
 }
 
 int main() {
@@ -740,4 +996,9 @@ int main() {
   in_flight_stop();
   start_attempt_identity();
   unsupported_buffer_resize();
+  latency_notifications();
+  resync_and_overload();
+  output_ready_modes();
+  callback_entry_variants();
+  overlapping_callbacks();
 }

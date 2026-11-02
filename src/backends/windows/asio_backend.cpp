@@ -331,9 +331,13 @@ public:
   uint32_t faults() const noexcept override { return faults_.load(std::memory_order_acquire); }
   ae_diagnostic diagnostic() const noexcept override { return diagnostic_; }
   void observations(ae_stream_status &status) const noexcept override {
+    const uint64_t revision = latency_snapshot_revision_.load();
     status.latency_valid = latency_valid_.load();
     status.input_latency_frames = input_latency_.load();
     status.output_latency_frames = output_latency_.load();
+    if (revision != latency_revision_.load()) {
+      status.latency_valid = 0;
+    }
     status.callback_count = callback_count_.load();
     status.max_callback_nanoseconds = ticks_to_ns(max_ticks_.load());
     status.deadline_overruns = overruns_.load();
@@ -414,7 +418,7 @@ public:
       faults_.fetch_or(AE_FAULT_RESYNC);
       return 1;
     case kAsioLatenciesChanged:
-      latency_valid_.store(0);
+      latency_revision_.fetch_add(1);
       latency_dirty_.store(true);
       return 1;
     case kAsioOverload:
@@ -665,11 +669,13 @@ private:
     }
   }
   void read_latencies() {
+    const uint64_t revision = latency_revision_.fetch_add(1) + 1;
     long input = 0, output = 0;
     if (driver_->getLatencies(&input, &output) == ASE_OK && input >= 0 && output >= 0) {
       input_latency_.store(static_cast<uint32_t>(input));
       output_latency_.store(static_cast<uint32_t>(output));
       latency_valid_.store(1);
+      latency_snapshot_revision_.store(revision);
     } else {
       latency_valid_.store(0);
     }
@@ -715,6 +721,7 @@ private:
   std::atomic<bool> gate_{false}, prepared_{false}, latency_dirty_{false};
   std::atomic_flag processing_ = ATOMIC_FLAG_INIT;
   std::atomic<uint32_t> faults_{0}, latency_valid_{0}, input_latency_{0}, output_latency_{0};
+  std::atomic<uint64_t> latency_revision_{0}, latency_snapshot_revision_{0};
   std::atomic<uint64_t> last_callback_{0}, callback_count_{0}, max_ticks_{0}, overruns_{0},
       overloads_{0};
   Owner owner_;
