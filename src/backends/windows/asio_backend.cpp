@@ -344,7 +344,7 @@ public:
     status.driver_overloads = overloads_.load();
   }
 
-  void buffer(long index, ASIOBool direct) noexcept {
+  void buffer(long index) noexcept {
     if (!prepared_.load()) {
       return;
     }
@@ -358,9 +358,6 @@ public:
       faults_.fetch_or(AE_FAULT_CALLBACK);
       processing_.clear(std::memory_order_release);
       return;
-    }
-    if (direct == ASIOFalse) {
-      faults_.fetch_or(AE_FAULT_CALLBACK);
     }
     try {
       if (gate_.load() && faults() == 0) {
@@ -737,10 +734,10 @@ public:
   AsioBackend *backend;
 };
 
-void buffer_switch(long index, ASIOBool direct) {
+void buffer_switch(long index, ASIOBool) {
   RouteLease lease;
   if (lease.backend != nullptr) {
-    lease.backend->buffer(index, direct);
+    lease.backend->buffer(index);
   }
 }
 ASIOTime *time_switch(ASIOTime *, long index, ASIOBool direct) {

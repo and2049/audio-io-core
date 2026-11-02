@@ -448,12 +448,15 @@ void failures() {
   state.direct = ASIOFalse;
   const uint32_t calls = processor.calls.load();
   AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
-  AE_CHECK(processor.calls == calls);
+  AE_CHECK(processor.calls == calls + 1);
   ae_stream_status status{};
   status.struct_size = sizeof(status);
-  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK &&
-           status.fault_flags == AE_FAULT_CALLBACK);
+  AE_CHECK(ae_stream_get_status(stream, &status) == AE_OK && status.fault_flags == 0);
+  AE_CHECK(state.storage[2][0] == 0x40000000 && state.storage[4][0] == -0x40000000);
+  AE_CHECK(ae_stream_stop(stream) == AE_OK);
   state.direct = ASIOTrue;
+  AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
+  AE_CHECK(processor.calls == calls + 2);
   AE_CHECK(ae_stream_close(stream) == AE_OK);
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
 }
@@ -933,8 +936,11 @@ void callback_entry_variants() {
   AE_CHECK(processor.calls == 3 && status_of(stream).delivered_frames == 384);
   AE_CHECK(state.storage[3][0] == 0x40000000 && state.storage[5][0] == -0x40000000);
   AE_CHECK(state.callbacks.bufferSwitchTimeInfo(&time, 1, ASIOFalse) == nullptr);
-  AE_CHECK(processor.calls == 3 && status_of(stream).fault_flags == AE_FAULT_CALLBACK);
-  AE_CHECK(state.storage[3][0] == 0 && state.storage[5][0] == 0);
+  AE_CHECK(processor.calls == 4 && status_of(stream).fault_flags == 0);
+  AE_CHECK(state.storage[3][0] == 0x40000000 && state.storage[5][0] == -0x40000000);
+  state.callbacks.bufferSwitch(0, ASIOFalse);
+  AE_CHECK(processor.calls == 5 && status_of(stream).delivered_frames == 640);
+  AE_CHECK(status_of(stream).state == AE_STREAM_STATE_RUNNING);
   AE_CHECK(ae_stream_close(stream) == AE_OK);
   for (long index : {-1L, 2L}) {
     AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
