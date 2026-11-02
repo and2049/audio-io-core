@@ -269,7 +269,14 @@ public:
     }
     ae_result result = owner_.invoke([&] {
       const auto activated = activate(id);
-      return activated == AE_OK ? capabilities(caps) : activated;
+      if (activated != AE_OK) {
+        return activated;
+      }
+      const auto queried = capabilities(caps);
+      if (queried == AE_OK && faults() != 0) {
+        return fail("probe configuration invalidated", faults(), AE_ERROR_CONFIGURATION_CHANGED);
+      }
+      return queried;
     });
     const ae_result cleanup = close();
     return cleanup == AE_OK ? result : cleanup;

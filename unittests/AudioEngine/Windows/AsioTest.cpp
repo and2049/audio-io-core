@@ -53,7 +53,7 @@ struct State {
   bool fail_create_empty = false, invalid_dispose = false;
   bool change_rate_during_create = false, change_map_during_create = false;
   bool notify_set_rate = false, notify_create_rate = false, notify_query_rate = false;
-  bool notify_latency_rate = false;
+  bool notify_latency_rate = false, notify_probe_rate = false;
   double notified_rate = 96000;
   ASIOSampleType created_type = ASIOSTInt32LSB;
   bool change_type_during_create = false, fail_final_channel_info = false;
@@ -189,7 +189,7 @@ public:
   ASIOError getSampleRate(ASIOSampleRate *rate) override {
     control_thread();
     *rate = rate_;
-    if (created_ && state.notify_query_rate) {
+    if ((created_ && state.notify_query_rate) || state.notify_probe_rate) {
       rate_ = state.notified_rate;
       state.callbacks.sampleRateDidChange(rate_);
     }
@@ -546,6 +546,36 @@ void preparation_changes() {
   AE_CHECK(ae_context_destroy(ctx) == AE_OK);
 }
 
+void probe_changes() {
+  state.owner = 0;
+  auto *ctx = context();
+  auto spec = request();
+  ae_stream_format format{};
+  format.struct_size = sizeof(format);
+  ae_stream *stream = nullptr;
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  ae_capability_snapshot *caps = nullptr;
+  for (double rate : {0.0, 96000.0}) {
+    state.notified_rate = rate;
+    state.notify_probe_rate = true;
+    const uint32_t released = state.releases;
+    AE_CHECK(ae_context_probe_device(ctx, "asio", identity, &caps) ==
+             AE_ERROR_CONFIGURATION_CHANGED);
+    AE_CHECK(caps == nullptr && state.releases == released + 1);
+    ae_diagnostic diagnostic{};
+    diagnostic.struct_size = sizeof(diagnostic);
+    AE_CHECK(ae_context_get_diagnostic(ctx, &diagnostic) == AE_OK);
+    AE_CHECK(diagnostic.result == AE_ERROR_CONFIGURATION_CHANGED);
+    AE_CHECK(diagnostic.native_code ==
+             (AE_FAULT_SAMPLE_RATE | (rate == 0 ? AE_FAULT_CLOCK_LOST : 0)));
+    state.notify_probe_rate = false;
+    AE_CHECK(ae_context_probe_device(ctx, "asio", identity, &caps) == AE_OK);
+    AE_CHECK(ae_capability_snapshot_release(caps) == AE_OK);
+  }
+  AE_CHECK(ae_context_destroy(ctx) == AE_OK);
+}
+
 void watchdog_timing() {
   const uint64_t frequency = 10000000;
   const uint64_t timeout = ae::detail::asio_stall_timeout(frequency, 128, 48000);
@@ -779,7 +809,14 @@ void latency_notifications() {
   ae_stream_format format{};
   format.struct_size = sizeof(format);
   ae_stream *stream = nullptr;
+  const uint32_t opening = state.latency_queries.load() + 1;
+  state.notify_latency_query.store(opening);
+  permit_latency(opening);
   AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  wait_until([&] { return state.latency_queries.load() == opening + 1; });
+  AE_CHECK(status_of(stream).latency_valid == 0 && status_of(stream).fault_flags == 0);
+  permit_latency(UINT32_MAX);
+  wait_until([&] { return status_of(stream).latency_valid == 1; });
   Processor processor;
   AE_CHECK(ae_stream_start(stream, process, &processor) == AE_OK);
   AE_CHECK(status_of(stream).latency_valid == 1);
@@ -996,6 +1033,7 @@ int main() {
   lifecycle();
   failures();
   preparation_changes();
+  probe_changes();
   watchdog_timing();
   allocation_cleanup();
   channel_routing();
