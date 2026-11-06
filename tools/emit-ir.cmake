@@ -57,7 +57,7 @@ foreach(index RANGE 0 ${last_entry})
 
   if(cl_mode)
     list(PREPEND filtered /clang:-S /clang:-emit-llvm /clang:-fsave-optimization-record
-      "/clang:-foptimization-record-file=${stem}.opt.yaml" "/Fo${stem}.ll")
+      "/clang:-foptimization-record-file=${stem}.opt.yaml" "/clang:-o${stem}.ll")
   else()
     list(PREPEND filtered -S -emit-llvm -fsave-optimization-record
       "-foptimization-record-file=${stem}.opt.yaml" -o "${stem}.ll")
