@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: brew install ninja
+      - run: brew install ninja clang-format
       - run: cmake --preset clang-release
       - run: cmake --build --preset clang-release
       - run: ctest --preset clang-release
