@@ -933,9 +933,17 @@ void permission() {
   const uint32_t queries = hal.access_queries;
   spec.input_channels = {AE_CHANNEL_MODE_NONE, 0, nullptr};
   AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
-  AE_CHECK(hal.access_queries == queries && format.input_channels == 0);
+  AE_CHECK(hal.access_queries == queries + 1 && format.input_channels == 0);
   AE_CHECK(hal.usage[0] == std::vector<UInt32>({0, 0}));
   AE_CHECK(ae_stream_close(stream) == AE_OK);
+  spec.input_device_id = playback;
+  spec.output_device_id = playback;
+  spec.output_channels = {AE_CHANNEL_MODE_BACKEND_DEFAULT, 0, nullptr};
+  AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);
+  AE_CHECK(hal.access_queries == queries + 1 && format.output_channels == 2);
+  AE_CHECK(ae_stream_close(stream) == AE_OK);
+  spec.input_device_id = duplex;
+  spec.output_device_id = duplex;
   hal.access = ae::CaptureAccess::Undetermined;
   spec = request();
   AE_CHECK(ae_stream_open(ctx, &spec, &stream, &format) == AE_OK);

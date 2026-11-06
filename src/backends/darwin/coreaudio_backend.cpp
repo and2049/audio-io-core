@@ -896,9 +896,6 @@ private:
     const std::string &output_id =
         request.output_device_id.empty() ? request.device_id : request.output_device_id;
     const bool combined = inputs && outputs && request.device_id != output_id;
-    if (inputs && hal_->capture_access(true) == CaptureAccess::Denied) {
-      return fail("microphone permission", 0, AE_ERROR_PERMISSION_DENIED);
-    }
     AudioObjectID device = 0;
     uint32_t bases[2]{}, limits[2]{};
     ae_result result = combined ? combine(request.device_id, output_id, device, bases, limits)
@@ -917,6 +914,10 @@ private:
     result = describe(device, caps, shape);
     if (result != AE_OK) {
       return result;
+    }
+    if ((inputs || shape.sides[0].channels != 0) &&
+        hal_->capture_access(true) == CaptureAccess::Denied && inputs) {
+      return fail("microphone permission", 0, AE_ERROR_PERMISSION_DENIED);
     }
     uint32_t rate = request.sample_rate == 0 ? caps.info.current_sample_rate : request.sample_rate;
     if (!supports(shape.ranges, rate)) {
