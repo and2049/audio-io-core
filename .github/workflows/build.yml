@@ -1,0 +1,28 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ninja
+      - run: cmake --preset clang-release
+      - run: cmake --build --preset clang-release
+      - run: ctest --preset clang-release
+      - run: cmake --build --preset clang-release --target format-check
+
+  windows-x86_64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+      - run: cmake --preset clang-cl-release
+      - run: cmake --build --preset clang-cl-release
+      - run: ctest --preset clang-cl-release
