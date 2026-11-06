@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
+if(CMAKE_HOST_APPLE
+   AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
+   AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0 CACHE STRING "Minimum macOS version" FORCE)
+endif()
 set(AUDIO_ENGINE_REQUESTED_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
-project(AudioEngine VERSION 0.2.0 LANGUAGES C CXX)
+project(AudioEngine VERSION 0.3.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL
    AND NOT CMAKE_CONFIGURATION_TYPES
@@ -19,6 +24,12 @@ option(AUDIO_ENGINE_BUILD_TESTS "Build the audio_engine tests" ${AUDIO_ENGINE_TE
 option(AUDIO_ENGINE_BUILD_EXAMPLES "Build the audio_engine examples" ${PROJECT_IS_TOP_LEVEL})
 option(AUDIO_ENGINE_ENABLE_ASIO "Build the Windows x86-64 ASIO backend" OFF)
 set(AUDIO_ENGINE_ASIO_SDK "" CACHE PATH "External ASIO SDK root containing common/iasiodrv.h")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(AUDIO_ENGINE_COREAUDIO_DEFAULT ON)
+else()
+  set(AUDIO_ENGINE_COREAUDIO_DEFAULT OFF)
+endif()
+option(AUDIO_ENGINE_ENABLE_COREAUDIO "Build the macOS Core Audio backend" ${AUDIO_ENGINE_COREAUDIO_DEFAULT})
 
 function(audio_engine_set_warnings target)
   if(MSVC)
@@ -47,6 +58,17 @@ if(AUDIO_ENGINE_ENABLE_ASIO)
   target_include_directories(audio_engine SYSTEM PRIVATE "${AUDIO_ENGINE_ASIO_SDK}/common")
   target_compile_definitions(audio_engine PRIVATE AUDIO_ENGINE_HAS_ASIO=1 NOMINMAX WIN32_LEAN_AND_MEAN)
   target_link_libraries(audio_engine PRIVATE ole32 advapi32 user32)
+endif()
+
+if(AUDIO_ENGINE_ENABLE_COREAUDIO)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    message(FATAL_ERROR "Core Audio requires macOS")
+  endif()
+  target_sources(audio_engine PRIVATE src/backends/darwin/coreaudio_backend.cpp)
+  target_include_directories(audio_engine PRIVATE src)
+  target_compile_definitions(audio_engine PRIVATE AUDIO_ENGINE_HAS_COREAUDIO=1)
+  target_link_libraries(audio_engine PRIVATE "-framework CoreAudio" "-framework CoreFoundation"
+                                              "-framework AVFoundation")
 endif()
 
 if(AUDIO_ENGINE_BUILD_TESTS)

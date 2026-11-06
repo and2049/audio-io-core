@@ -15,6 +15,10 @@
 #include "backends/windows/asio_backend.h"
 #endif
 
+#ifdef AUDIO_ENGINE_HAS_COREAUDIO
+#include "backends/darwin/coreaudio_backend.h"
+#endif
+
 struct ae_device_snapshot {
   ae_context *context = nullptr;
   std::vector<std::string> strings;
@@ -217,6 +221,7 @@ ae_result enumerate_devices(const ae_context *context, ae_device_snapshot **out_
     info.input_channels = device.input_channels;
     info.output_channels = device.output_channels;
     info.channel_counts_known = device.channel_counts_known;
+    info.flags = device.pairable ? AE_DEVICE_PAIRABLE : 0;
     snapshot->infos.push_back(info);
     string_index += 3;
   }
@@ -250,18 +255,20 @@ ae_result open_stream(ae_context *context, const ae_stream_request *request, ae_
   if (request->frames_per_block > AE_MAX_FRAMES_PER_BLOCK) {
     return AE_ERROR_INVALID_ARGUMENT;
   }
-  if (std::strcmp(request->input_device_id, request->output_device_id) != 0) {
+  const ae::Device *device = find_device(context, request->backend_id, request->input_device_id);
+  const ae::Device *output_device =
+      find_device(context, request->backend_id, request->output_device_id);
+  if (device != output_device && (device == nullptr || output_device == nullptr ||
+                                  !device->pairable || !output_device->pairable)) {
     return AE_ERROR_UNSUPPORTED_CONFIGURATION;
   }
-
-  const ae::Device *device = find_device(context, request->backend_id, request->input_device_id);
   if (device == nullptr) {
     return AE_ERROR_NOT_FOUND;
   }
   const uint32_t available_inputs =
       device->channel_counts_known ? device->input_channels : AE_MAX_CHANNELS;
   const uint32_t available_outputs =
-      device->channel_counts_known ? device->output_channels : AE_MAX_CHANNELS;
+      output_device->channel_counts_known ? output_device->output_channels : AE_MAX_CHANNELS;
   if (!valid_selection(request->input_channels, available_inputs) ||
       !valid_selection(request->output_channels, available_outputs)) {
     return AE_ERROR_INVALID_ARGUMENT;
@@ -281,6 +288,7 @@ ae_result open_stream(ae_context *context, const ae_stream_request *request, ae_
   ae::OpenRequest spec;
   spec.backend_id = request->backend_id;
   spec.device_id = request->input_device_id;
+  spec.output_device_id = request->output_device_id;
   spec.inputs.mode = request->input_channels.mode;
   spec.inputs.indices = copy_indices(request->input_channels);
   spec.outputs.mode = request->output_channels.mode;
@@ -376,6 +384,13 @@ ae_result ae_context_create(const ae_context_options *options, ae_context **out_
     }
 #ifdef AUDIO_ENGINE_HAS_ASIO
     auto backend = ae::make_asio_backend();
+    const ae_result result = backend->refresh();
+    if (result != AE_OK) {
+      return result;
+    }
+    return ae::detail::create_context_with_backend(std::move(backend), out_context);
+#elif defined(AUDIO_ENGINE_HAS_COREAUDIO)
+    auto backend = ae::make_coreaudio_backend();
     const ae_result result = backend->refresh();
     if (result != AE_OK) {
       return result;

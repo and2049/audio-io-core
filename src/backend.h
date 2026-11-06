@@ -16,6 +16,7 @@ struct Device {
   uint32_t input_channels = 0;
   uint32_t output_channels = 0;
   bool channel_counts_known = true;
+  bool pairable = false;
 };
 
 struct Capabilities {
@@ -33,6 +34,7 @@ struct ChannelSelection {
 struct OpenRequest {
   std::string backend_id;
   std::string device_id;
+  std::string output_device_id;
   ChannelSelection inputs;
   ChannelSelection outputs;
   uint32_t sample_rate = 0;

@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define AE_API_VERSION_MAJOR 0u
-#define AE_API_VERSION_MINOR 2u
+#define AE_API_VERSION_MINOR 3u
 #define AE_MAX_CHANNELS 256u
 #define AE_MAX_SAMPLE_RATE 768000u
 #define AE_MAX_FRAMES_PER_BLOCK 65536u
@@ -29,7 +29,8 @@ enum {
   AE_ERROR_PROCESSOR_FAILURE = 10,
   AE_ERROR_ALLOCATION_FAILURE = 11,
   AE_ERROR_QUIESCENCE_FAILURE = 12,
-  AE_ERROR_CONFIGURATION_CHANGED = 13
+  AE_ERROR_CONFIGURATION_CHANGED = 13,
+  AE_ERROR_PERMISSION_DENIED = 14
 };
 
 typedef int32_t ae_channel_mode;
@@ -67,6 +68,7 @@ enum {
   AE_FAULT_CALLBACK = 16u,
   AE_FAULT_CLOCK_LOST = 32u
 };
+enum { AE_DEVICE_PAIRABLE = 1u };
 
 typedef struct ae_channel_info {
   uint32_t struct_size;
@@ -112,6 +114,7 @@ typedef struct ae_device_info {
   uint32_t input_channels;
   uint32_t output_channels;
   uint32_t channel_counts_known;
+  uint32_t flags;
 } ae_device_info;
 
 typedef struct ae_channel_selection {

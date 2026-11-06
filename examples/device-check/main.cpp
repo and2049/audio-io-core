@@ -56,6 +56,41 @@ ae_process_result process(void *user, const ae_audio_block *block) {
   return AE_PROCESS_OK;
 }
 
+constexpr float kToneLevel = 0.01f;
+constexpr float kToneThreshold = 0.0025f;
+constexpr uint64_t kUndetected = UINT64_MAX;
+
+struct Tone {
+  uint64_t start = 0;
+  double step = 0;
+  std::atomic<uint64_t> detected{kUndetected};
+  std::atomic<float> peak{0};
+};
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
+ae_process_result tone(void *user, const ae_audio_block *block) {
+  auto &state = *static_cast<Tone *>(user);
+  float peak = state.peak.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < block->frames; ++i) {
+    const uint64_t position = block->frame_position + i;
+    const float input = block->input_channels == 0 ? 0.0f : std::abs(block->inputs[0][i]);
+    if (position >= state.start) {
+      peak = std::max(peak, input);
+      if (input > kToneThreshold && state.detected.load(std::memory_order_relaxed) == kUndetected) {
+        state.detected.store(position, std::memory_order_relaxed);
+      }
+      const float value =
+          kToneLevel *
+          static_cast<float>(std::sin(static_cast<double>(position - state.start) * state.step));
+      for (uint32_t channel = 0; channel < block->output_channels; ++channel) {
+        block->outputs[channel][i] = value;
+      }
+    }
+  }
+  state.peak.store(peak, std::memory_order_relaxed);
+  return AE_PROCESS_OK;
+}
+
 void print_status(ae_stream *stream, const Processor &processor) {
   ae_stream_status status{};
   status.struct_size = sizeof(status);
@@ -75,21 +110,28 @@ void print_status(ae_stream *stream, const Processor &processor) {
 
 int main(int argc, char **argv) {
   const bool probe = argc == 3 && std::strcmp(argv[1], "--probe") == 0;
-  const bool run = argc == 9 && std::strcmp(argv[1], "--run") == 0;
+  const bool pair = argc == 9 && std::strcmp(argv[1], "--pair") == 0;
+  const bool loop = argc == 7 && std::strcmp(argv[1], "--tone") == 0;
+  const bool run = pair || loop || (argc == 9 && std::strcmp(argv[1], "--run") == 0);
   if (argc != 1 && !probe && !run) {
     std::fprintf(stderr,
                  "Usage: AudioEngineDeviceCheck [--probe device-index | --run device-index seconds "
-                 "rate frames input-index gain-percent cycles]\nDefault lists drivers. Gain 0 "
-                 "produces silent output; gain 1..100 enables passthrough.\n");
+                 "rate frames input-index gain-percent cycles | --pair input-device-index "
+                 "output-device-index seconds rate frames input-index gain-percent | --tone "
+                 "device-index seconds rate frames input-index]\nDefault lists drivers. Gain 0 "
+                 "produces silent output; gain 1..100 enables passthrough. --tone plays a 1 kHz "
+                 "tone at -40 dBFS and reports when it returns on the input.\n");
     return 2;
   }
+  const int shift = pair ? 1 : 0;
   const uint32_t selected = argc > 1 ? number(argv[2], 65535) : 0;
-  const uint32_t seconds = run ? number(argv[3], 3600) : 0;
-  const uint32_t rate = run ? number(argv[4], AE_MAX_SAMPLE_RATE) : 0;
-  const uint32_t frames = run ? number(argv[5], AE_MAX_FRAMES_PER_BLOCK) : 0;
-  const uint32_t input = run ? number(argv[6], AE_MAX_CHANNELS - 1) : 0;
-  const uint32_t gain = run ? number(argv[7], 100) : 0;
-  const uint32_t cycles = run ? number(argv[8], 1000) : 0;
+  const uint32_t selected_output = pair ? number(argv[3], 65535) : selected;
+  const uint32_t seconds = run ? number(argv[3 + shift], 3600) : 0;
+  const uint32_t rate = run ? number(argv[4 + shift], AE_MAX_SAMPLE_RATE) : 0;
+  const uint32_t frames = run ? number(argv[5 + shift], AE_MAX_FRAMES_PER_BLOCK) : 0;
+  const uint32_t input = run ? number(argv[6 + shift], AE_MAX_CHANNELS - 1) : 0;
+  const uint32_t gain = run && !loop ? number(argv[7 + shift], 100) : 0;
+  const uint32_t cycles = pair || loop ? 1 : run ? number(argv[8], 1000) : 0;
   if (run && (seconds == 0 || cycles == 0)) {
     return 2;
   }
@@ -97,15 +139,19 @@ int main(int argc, char **argv) {
   require(ae_context_create(&options, &context), "create context");
   ae_device_snapshot *devices = nullptr;
   require(ae_context_enumerate_devices(context, &devices), "enumerate");
-  std::string backend, id;
+  std::string backend, id, output_id;
   for (uint32_t i = 0; i < ae_device_snapshot_count(devices); ++i) {
     ae_device_info info{};
     info.struct_size = sizeof(info);
     require(ae_device_snapshot_get(devices, i, &info), "device");
-    std::printf("%u: %s | %s | %s\n", i, info.display_name, info.backend_id, info.device_id);
+    std::printf("%u: %s | %s | %s%s\n", i, info.display_name, info.backend_id, info.device_id,
+                (info.flags & AE_DEVICE_PAIRABLE) != 0 ? " | pairable" : "");
     if (i == selected) {
       backend = info.backend_id;
       id = info.device_id;
+    }
+    if (i == selected_output) {
+      output_id = info.device_id;
     }
   }
   require(ae_device_snapshot_release(devices), "release devices");
@@ -113,7 +159,7 @@ int main(int argc, char **argv) {
     require(ae_context_destroy(context), "destroy context");
     return 0;
   }
-  if (id.empty()) {
+  if (id.empty() || output_id.empty()) {
     require(AE_ERROR_NOT_FOUND, "selected device");
   }
   ae_capability_snapshot *snapshot = nullptr;
@@ -147,7 +193,7 @@ int main(int argc, char **argv) {
     request.struct_size = sizeof(request);
     request.backend_id = backend.c_str();
     request.input_device_id = id.c_str();
-    request.output_device_id = id.c_str();
+    request.output_device_id = output_id.c_str();
     request.input_channels = {AE_CHANNEL_MODE_EXPLICIT, 1, &input};
     request.output_channels = {AE_CHANNEL_MODE_EXPLICIT, 2, outputs};
     request.sample_rate = rate;
@@ -163,7 +209,12 @@ int main(int argc, char **argv) {
                   format.output_channels, gain);
       Processor processor;
       processor.gain = static_cast<float>(gain) / 100;
-      require(ae_stream_start(stream, process, &processor), "start");
+      Tone generator;
+      generator.start = format.sample_rate / 2;
+      generator.step = 2.0 * 3.14159265358979323846 * 1000.0 / format.sample_rate;
+      require(loop ? ae_stream_start(stream, tone, &generator)
+                   : ae_stream_start(stream, process, &processor),
+              "start");
       bool fault = false;
       for (uint32_t second = 0; second < seconds; ++second) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -178,6 +229,25 @@ int main(int argc, char **argv) {
       }
       require(ae_stream_stop(stream), "stop");
       print_status(stream, processor);
+      if (loop) {
+        ae_stream_status status{};
+        status.struct_size = sizeof(status);
+        require(ae_stream_get_status(stream, &status), "status");
+        const uint64_t detected = generator.detected.load();
+        std::printf("tone start=%llu peak=%.6f reported_latency=%u\n",
+                    static_cast<unsigned long long>(generator.start), generator.peak.load(),
+                    status.input_latency_frames + status.output_latency_frames);
+        if (detected == kUndetected) {
+          std::printf("tone not detected on input %u\n", input);
+          fault = true;
+        } else {
+          const uint64_t delay = detected - generator.start;
+          std::printf("tone detected=%llu round_trip=%llu frames (%.3f ms)\n",
+                      static_cast<unsigned long long>(detected),
+                      static_cast<unsigned long long>(delay),
+                      1000.0 * static_cast<double>(delay) / format.sample_rate);
+        }
+      }
       require(ae_stream_close(stream), "close");
       if (fault) {
         require(ae_context_destroy(context), "destroy context");
